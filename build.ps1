@@ -1,8 +1,17 @@
-param([switch]$Publish, [switch]$SelfContained, [switch]$FrameworkDependent)
+param(
+    [switch]$Publish,
+    [switch]$SelfContained,
+    [switch]$FrameworkDependent,
+    [ValidatePattern('^\d+\.\d+\.\d+(?:\.\d+)?$')]
+    [string]$Version
+)
 $ErrorActionPreference = 'Stop'
 Push-Location $PSScriptRoot
 try {
-    dotnet build CodexQuotaTray.slnx -c Release --nologo
+    [xml]$properties = Get-Content -LiteralPath Directory.Build.props -Raw
+    $buildVersion = if ($Version) { $Version } else { $properties.Project.PropertyGroup.Version }
+    # CD 传入四段版本号；本地构建仍使用项目中的基础版本。
+    dotnet build CodexQuotaTray.slnx -c Release "-p:Version=$buildVersion" --nologo
     if ($LASTEXITCODE -ne 0) { throw '构建失败。' }
     dotnet run --project tests/CodexQuotaTray.Tests -c Release --no-build
     if ($LASTEXITCODE -ne 0) { throw '测试失败。' }
@@ -16,15 +25,13 @@ try {
         if ($publishBoth -or $FrameworkDependent) {
             $variants += @{ Folder = 'CodexQuotaTray-no-runtime'; BundleRuntime = 'false'; Suffix = 'win-x64-no-runtime' }
         }
-        [xml]$properties = Get-Content -LiteralPath Directory.Build.props -Raw
-        $version = $properties.Project.PropertyGroup.Version
         foreach ($variant in $variants) {
             $output = Join-Path $PSScriptRoot ('dist/' + $variant.Folder)
-            dotnet publish src/CodexQuotaTray -c Release -r win-x64 --self-contained $variant.BundleRuntime -p:PublishSingleFile=true -p:DebugType=None -o $output --nologo
+            dotnet publish src/CodexQuotaTray -c Release -r win-x64 --self-contained $variant.BundleRuntime "-p:Version=$buildVersion" -p:PublishSingleFile=true -p:DebugType=None -o $output --nologo
             if ($LASTEXITCODE -ne 0) { throw ('发布失败：' + $variant.Suffix) }
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination $output -Force
             # 只打包本次发布的应用和说明，避免将输出目录中遗留的本机文件打进包。
-            $archive = Join-Path $PSScriptRoot ('dist/CodexQuotaTray-' + $version + '-' + $variant.Suffix + '.zip')
+            $archive = Join-Path $PSScriptRoot ('dist/CodexQuotaTray-' + $buildVersion + '-' + $variant.Suffix + '.zip')
             Compress-Archive -LiteralPath @((Join-Path $output 'CodexQuotaTray.exe'), (Join-Path $output 'README.md')) -DestinationPath $archive -Force
             Write-Output ('已生成：' + $archive)
         }

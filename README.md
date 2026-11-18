@@ -17,6 +17,8 @@ Codex 已登录账号，程序将使用codex-home里的 `auth.json` 账户凭据
 
 从 [Release](https://github.com/chocoQAQ/CodexQuotaTray/releases/latest) 获取最新版
 
+`main` 分支更新后，GitHub Actions 自动测试、编译并发布最新 Release（包含以下两个版本）。
+
 - **内置运行时版**：解压即可运行。
 - **无运行时版**：体积更小，需要安装 [.NET 10 Desktop Runtime x64](https://dotnet.microsoft.com/download/dotnet/10.0)。
 

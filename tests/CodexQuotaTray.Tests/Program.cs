@@ -88,6 +88,9 @@ internal static class Program
             });
             await Test("目标进程参数读取及环境白名单", async () =>
             {
+                // 云端全新检出没有 artifacts/verification，测试必须自行创建目录。
+                var homeDirectory = Path.Combine(Path.GetTempPath(), "CodexQuotaTray-process-" + Guid.NewGuid());
+                Directory.CreateDirectory(homeDirectory);
                 var start = new ProcessStartInfo(Environment.ProcessPath!)
                 {
                     UseShellExecute = false, CreateNoWindow = true,
@@ -95,7 +98,7 @@ internal static class Program
                 };
                 start.ArgumentList.Add("--process-fixture");
                 start.ArgumentList.Add("value with spaces");
-                start.Environment["CODEX_HOME"] = Path.GetFullPath("artifacts/verification");
+                start.Environment["CODEX_HOME"] = homeDirectory;
                 start.Environment["QUOTA_TEST_SECRET"] = "must-not-be-retained";
                 start.Environment["USERPROFILE"] = @"Z:\not-the-real-profile";
                 using var child = Process.Start(start)!;
@@ -108,12 +111,13 @@ internal static class Program
                     Equal("value with spaces", context.Arguments[2]);
                     Check(context.ProfileDirectory != start.Environment["USERPROFILE"]);
                     Equal(Environment.ProcessId, context.ParentId);
-                    Equal(Path.GetFullPath("artifacts/verification"), ActiveCodexSessionSource.ResolveHome(context));
+                    Equal(homeDirectory, ActiveCodexSessionSource.ResolveHome(context));
                 }
                 finally
                 {
                     await child.StandardInput.WriteLineAsync();
                     if (!child.WaitForExit(5000)) child.Kill();
+                    Directory.Delete(homeDirectory);
                 }
             });
             await Test("辅助进程排除及命令行存储覆盖", () =>

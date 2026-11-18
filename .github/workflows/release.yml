@@ -1,0 +1,148 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 默认只读；只有发布 job 可以创建标签、上传 Release 附件。
+permissions:
+  contents: read
+
+# 发布过程不被中途取消，避免留下只上传了部分附件的 Release。
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Generate release version
+        id: version
+        run: |
+          [xml]$properties = Get-Content -LiteralPath Directory.Build.props -Raw
+          $baseVersion = $properties.Project.PropertyGroup.Version
+          if ($baseVersion -notmatch '^\d+\.\d+\.\d+$') {
+              throw 'Directory.Build.props 的 Version 必须为三段数字。'
+          }
+          $version = $baseVersion + '.' + $env:GITHUB_RUN_NUMBER
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Output "Release version: $version"
+
+      - name: Build, test and package both variants
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: ./build.ps1 -Publish -Version $env:RELEASE_VERSION
+
+      - name: Verify packages and generate checksums
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $checksums = foreach ($variant in @('self-contained', 'no-runtime')) {
+              $name = 'CodexQuotaTray-' + $env:RELEASE_VERSION + '-win-x64-' + $variant + '.zip'
+              $archive = Join-Path dist $name
+              $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $archive).Path)
+              try {
+                  $entries = @($zip.Entries.FullName | Sort-Object)
+                  if (($entries -join ',') -ne 'CodexQuotaTray.exe,README.md') {
+                      throw "ZIP 内容不符合预期：$name"
+                  }
+              } finally { $zip.Dispose() }
+              $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $name"
+          }
+          Set-Content -LiteralPath dist/SHA256SUMS.txt -Value $checksums -Encoding utf8NoBOM
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-packages
+          path: |
+            dist/CodexQuotaTray-${{ steps.version.outputs.version }}-win-x64-*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-packages
+          path: release
+
+      - name: Publish latest GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum --check SHA256SUMS.txt
+          cd ..
+
+          # 如果 main 已更新，留给新构建发布，避免旧构建覆盖“最新版”。
+          current_head=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
+          if [[ "$current_head" != "$RELEASE_COMMIT" ]]; then
+            echo 'main 已有更新，此次构建不发布。'
+            exit 0
+          fi
+
+          tag="v$RELEASE_VERSION"
+          cat > release-notes.md <<EOF
+          自动构建自 main 分支，测试通过后发布。
+
+          - self-contained.zip：内置运行时，解压即可运行。
+          - no-runtime.zip：需要 .NET 10 Desktop Runtime x64。
+          - SHA256SUMS.txt：下载文件校验值。
+
+          源码提交：[$RELEASE_COMMIT](https://github.com/$GH_REPO/commit/$RELEASE_COMMIT)
+          构建记录：$WORKFLOW_RUN_URL
+          EOF
+
+          if existing=$(gh release view "$tag" --json isDraft,targetCommitish --jq '[.isDraft, .targetCommitish] | @tsv' 2>/dev/null); then
+            IFS=$'\t' read -r is_draft target <<< "$existing"
+            if [[ "$target" != "$RELEASE_COMMIT" ]]; then
+              echo '同名 Release 指向不同提交，停止发布。' >&2
+              exit 1
+            fi
+            if [[ "$is_draft" != 'true' ]]; then
+              echo '本次构建已发布，无需重复上传。'
+              exit 0
+            fi
+          else
+            gh release create "$tag" --target "$RELEASE_COMMIT" \
+              --title "CodexQuotaTray $RELEASE_VERSION" --draft --notes-file release-notes.md
+          fi
+
+          # 先上传齐全再公开；同一次 run 重试时仅补齐尚未发布的草稿。
+          gh release upload "$tag" release/*.zip release/SHA256SUMS.txt --clobber
+          gh release edit "$tag" --draft=false --latest

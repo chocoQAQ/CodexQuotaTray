@@ -79,6 +79,12 @@ ChatGPT-Account-Id: <account_id>
 
 `build.ps1 -Publish` 默认生成两个 win-x64 单文件版本及各自的 ZIP：`dist/CodexQuotaTray-self-contained` 包含运行时，`dist/CodexQuotaTray-no-runtime` 不包含运行时。无运行时版本需要目标系统安装 .NET 10 Desktop Runtime x64。使用 `-SelfContained` 或 `-FrameworkDependent` 可以单独发布其中一种。ZIP 只包含本次构建的 EXE 和 README，避免夹带本机诊断或其他遗留文件。
 
+## 自动发布
+
+`.github/workflows/release.yml` 在 `main` 每次 push 时触发，也支持 Actions 页面手动运行。Windows runner 安装 .NET 10，通过 `build.ps1 -Publish -Version <版本>` 运行测试、构建两个 ZIP，并生成 SHA-256 校验文件。版本号由 `Directory.Build.props` 的三段版本加 Actions 构建序号组成，如 `1.2.0.1`；工作流不提交版本修改，不产生触发循环。
+
+构建 job 仅有只读权限。成功后，发布 job 用 GitHub 自动提供的 `GITHUB_TOKEN` 创建 `v<版本>` 标签与 Release，无需额外配置个人令牌。它先校验附件哈希，再上传至草稿，附件齐全后公开并标记为 Latest。失败构建不会发布；重试可补齐草稿，同一构建已经公开则跳过。历史 Release 保留，旧提交的构建若发现 `main` 已更新则不抢占最新版。工作流固定官方 Actions 的提交 SHA，并串行发布，避免中途取消造成附件缺失。
+
 ## 诊断
 
 关闭已有圆环后，可以执行一次查询并保存摘要：
