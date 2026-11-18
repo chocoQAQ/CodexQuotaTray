@@ -41,7 +41,7 @@ cd CodexQuotaTray
 
 C# / .NET 10 / WinForms，无第三方 NuGet 依赖。
 
-更多说明见 [架构与实现](docs/implementation.md)。
+更多说明见 [架构、实现与取舍](docs/architecture-and-tradeoffs.md)。
 
 ## 注
 我没想好一些功能细节该怎么做，所以选了这种简单的实现方案，如果有更好的实现方式，欢迎提交 Pull Request。
