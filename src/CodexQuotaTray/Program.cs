@@ -48,7 +48,9 @@ internal static class Program
                     new JsonSerializerOptions { WriteIndented = true }));
                 return state.Snapshot is not null && !state.IsError ? 0 : 1;
             }
-            using var context = new TrayApplication(monitor);
+            var startup = new StartupRegistration(Environment.ProcessPath ?? Application.ExecutablePath,
+                home is null ? [] : ["--codex-home", home]);
+            using var context = new TrayApplication(monitor, startup);
             Application.Run(context);
             return 0;
         }

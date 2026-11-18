@@ -71,14 +71,20 @@ ChatGPT-Account-Id: <account_id>
 
 `SingleInstance` 使用含用户 SID 的 `Local\` 命名互斥锁。同一用户、同一 Windows 会话重复启动时，新进程向旧实例发送显示详情消息，然后退出。
 
-退出时停止计时器、取消请求、删除托盘图标并释放窗口资源。没有开机启动、跟随启动或守护逻辑。
+`StartupRegistration` 提供托盘菜单中的“开机自启”开关，默认关闭。用户勾选后在 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 写入 `CodexQuotaTray`，取消勾选只删除该值。命令使用当前 EXE 的绝对路径，并保留显式指定的 `--codex-home`，按照 Windows 参数引用规则处理空格和反斜线。开关操作无需管理员权限，只有写入成功后菜单才显示勾选。Windows 设置中另外禁用的启动项仍需在系统中启用。
+
+这是用户登录 Windows 后启动托盘程序，不会启动 Codex。移动程序前先关闭开关，移动后再开启以更新路径。两个发布版本共用一个启动项，不能重复注册。退出时停止计时器、取消请求、删除托盘图标并释放窗口资源；自启设置保留至用户主动关闭。没有跟随启动或守护进程。
+
+## 发布版本
+
+`build.ps1 -Publish` 默认生成两个 win-x64 单文件版本及各自的 ZIP：`dist/CodexQuotaTray-self-contained` 包含运行时，`dist/CodexQuotaTray-no-runtime` 不包含运行时。无运行时版本需要目标系统安装 .NET 10 Desktop Runtime x64。使用 `-SelfContained` 或 `-FrameworkDependent` 可以单独发布其中一种。ZIP 只包含本次构建的 EXE 和 README，避免夹带本机诊断或其他遗留文件。
 
 ## 诊断
 
 关闭已有圆环后，可以执行一次查询并保存摘要：
 
 ```powershell
-Start-Process .\dist\CodexQuotaTray\CodexQuotaTray.exe `
+Start-Process .\dist\CodexQuotaTray-self-contained\CodexQuotaTray.exe `
   -ArgumentList '--diagnose', 'diagnosis.json' -Wait
 ```
 

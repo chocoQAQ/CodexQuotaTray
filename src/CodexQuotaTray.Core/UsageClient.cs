@@ -29,7 +29,7 @@ public sealed class UsageClient(HttpClient http, TimeProvider? timeProvider = nu
         using var request = new HttpRequestMessage(HttpMethod.Get, Endpoint);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", credentials.AccessToken);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        request.Headers.UserAgent.ParseAdd("CodexQuotaTray/1.1.0");
+        request.Headers.UserAgent.ParseAdd("CodexQuotaTray/1.2.0");
         if (!string.IsNullOrWhiteSpace(credentials.AccountId))
             request.Headers.Add("ChatGPT-Account-Id", credentials.AccountId);
 

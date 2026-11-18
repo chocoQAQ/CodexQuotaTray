@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security;
 using CodexQuotaTray.Core;
 using CodexQuotaTray.Infrastructure;
 
@@ -7,11 +8,13 @@ namespace CodexQuotaTray.Presentation;
 internal sealed class TrayApplication : ApplicationContext
 {
     private readonly QuotaMonitor monitor;
+    private readonly StartupRegistration startup;
     private readonly TrayIcon tray = new();
     private readonly DetailsForm details = new();
     private readonly ContextMenuStrip menu = new();
     private readonly ToolStripMenuItem statusItem = new("正在读取额度…");
     private readonly ToolStripMenuItem refreshItem = new("立即刷新");
+    private readonly ToolStripMenuItem startupItem = new("开机自启");
     private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = (int)QuotaMonitor.RefreshInterval.TotalMilliseconds };
     private readonly System.Windows.Forms.Timer visibilityTimer = new() { Interval = 1000 };
     private readonly CancellationTokenSource lifetime = new();
@@ -20,9 +23,10 @@ internal sealed class TrayApplication : ApplicationContext
     private int visibilityAttempts;
     private Task? refreshTask;
 
-    public TrayApplication(QuotaMonitor monitor)
+    public TrayApplication(QuotaMonitor monitor, StartupRegistration startup)
     {
         this.monitor = monitor;
+        this.startup = startup;
         // 明确安装 WinForms 同步上下文，await 返回后只在 UI 线程更新窗口和图标。
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
         menu.Items.Add(statusItem);
@@ -31,6 +35,9 @@ internal sealed class TrayApplication : ApplicationContext
         menu.Items.Add(refreshItem);
         refreshItem.Click += (_, _) => StartRefresh();
         menu.Items.Add("托盘显示设置", null, (_, _) => OpenTaskbarSettings());
+        menu.Items.Add(startupItem);
+        startupItem.Click += (_, _) => ToggleStartup();
+        menu.Opening += (_, _) => UpdateStartupMenu();
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) => ExitThread());
         tray.ShowRequested += ShowDetails;
@@ -107,6 +114,36 @@ internal sealed class TrayApplication : ApplicationContext
         {
             MessageBox.Show("请打开 Windows 设置 → 个性化 → 任务栏，设置圆环为始终显示。", "Codex 额度圆环");
         }
+    }
+
+    private void UpdateStartupMenu()
+    {
+        try
+        {
+            startupItem.Checked = startup.IsEnabled();
+            startupItem.Enabled = true;
+            startupItem.ToolTipText = "登录 Windows 后在托盘启动；取消勾选可关闭。";
+        }
+        catch (Exception error) when (error is UnauthorizedAccessException or SecurityException or IOException)
+        {
+            startupItem.Enabled = false;
+            startupItem.ToolTipText = "当前用户无法读取开机自启设置。";
+        }
+    }
+
+    private void ToggleStartup()
+    {
+        try
+        {
+            // 不使用 CheckOnClick：仅在写入成功后显示勾选，避免失败时界面与实际状态不符。
+            startup.SetEnabled(!startup.IsEnabled());
+        }
+        catch (Exception error) when (error is UnauthorizedAccessException or SecurityException or IOException or ArgumentException)
+        {
+            MessageBox.Show("无法更改开机自启设置，请检查当前用户权限，或缩短程序路径后重试。",
+                "Codex 额度圆环", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        UpdateStartupMenu();
     }
 
     protected override void ExitThreadCore()

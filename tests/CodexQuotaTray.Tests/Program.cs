@@ -4,6 +4,7 @@ using System.Diagnostics;
 using CodexQuotaTray.Core;
 using CodexQuotaTray.Presentation;
 using CodexQuotaTray.Infrastructure;
+using Microsoft.Win32;
 
 namespace CodexQuotaTray.Tests;
 
@@ -31,6 +32,60 @@ internal static class Program
         }
         try
         {
+            await Test("自启开关默认关闭、保存参数并只删除自身启动项", () =>
+            {
+                // 使用独立临时注册表键，不修改实际的 Windows 登录启动项。
+                var keyPath = @"Software\CodexQuotaTray.Tests\" + Guid.NewGuid();
+                try
+                {
+                    const string executable = @"C:\My Apps\CodexQuotaTray.exe";
+                    string[] arguments = ["--codex-home", @"D:\Codex 登录目录\"];
+                    var startup = new StartupRegistration(executable, arguments, keyPath);
+                    Check(!startup.IsEnabled());
+                    startup.SetEnabled(false); // 未开启时关闭也不创建注册表键。
+                    using (var missing = Registry.CurrentUser.OpenSubKey(keyPath)) Check(missing is null);
+                    using (var key = Registry.CurrentUser.CreateSubKey(keyPath)) key.SetValue("OtherApp", "leave-this-value");
+                    startup.SetEnabled(true);
+                    Check(new StartupRegistration(executable, arguments, keyPath).IsEnabled());
+                    using (var key = Registry.CurrentUser.OpenSubKey(keyPath)!)
+                    {
+                        var command = (string)key.GetValue("CodexQuotaTray")!;
+                        Equal(RegistryValueKind.String, key.GetValueKind("CodexQuotaTray"));
+                        Check(ProcessParametersReader.SplitArguments(command).SequenceEqual(new[] { executable }.Concat(arguments)));
+                    }
+                    // 从另一个发布版本关闭时，也能移除共用启动项。
+                    var otherBuild = new StartupRegistration(@"D:\no-runtime\CodexQuotaTray.exe", [], keyPath);
+                    Check(otherBuild.IsEnabled());
+                    otherBuild.SetEnabled(false);
+                    Check(!startup.IsEnabled());
+                    using (var key = Registry.CurrentUser.OpenSubKey(keyPath)!)
+                        Equal("leave-this-value", key.GetValue("OtherApp"));
+                }
+                finally { Registry.CurrentUser.DeleteSubKeyTree(keyPath, false); }
+                return Task.CompletedTask;
+            });
+            await Test("自启参数引号正确往返、超长命令保留原设置", async () =>
+            {
+                var keyPath = @"Software\CodexQuotaTray.Tests\" + Guid.NewGuid();
+                try
+                {
+                    const string executable = @"C:\CodexQuotaTray.exe";
+                    string[] arguments = ["", "has spaces", "embedded\"quote", @"trailing slash\", "斜线\\\"引号"];
+                    var startup = new StartupRegistration(executable, arguments, keyPath);
+                    startup.SetEnabled(true);
+                    string original;
+                    using (var key = Registry.CurrentUser.OpenSubKey(keyPath)!)
+                    {
+                        original = (string)key.GetValue("CodexQuotaTray")!;
+                        Check(ProcessParametersReader.SplitArguments(original).SequenceEqual(new[] { executable }.Concat(arguments)));
+                    }
+                    var tooLong = new StartupRegistration(executable, [new string('x', 260)], keyPath);
+                    await Throws<ArgumentException>(() => { tooLong.SetEnabled(true); return Task.CompletedTask; });
+                    using (var key = Registry.CurrentUser.OpenSubKey(keyPath)!) Equal(original, key.GetValue("CodexQuotaTray"));
+                    await Throws<ArgumentException>(() => Task.FromResult(new StartupRegistration("relative.exe", [], keyPath)));
+                }
+                finally { Registry.CurrentUser.DeleteSubKeyTree(keyPath, false); }
+            });
             await Test("目标进程参数读取及环境白名单", async () =>
             {
                 var start = new ProcessStartInfo(Environment.ProcessPath!)
