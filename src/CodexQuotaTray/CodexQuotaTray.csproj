@@ -7,4 +7,9 @@
     <AssemblyName>CodexQuotaTray</AssemblyName>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../CodexQuotaTray.Core/CodexQuotaTray.Core.csproj" /></ItemGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="UpdateVariant" Value="self-contained" Condition="'$(SelfContained)' == 'true'" />
+    <AssemblyMetadata Include="UpdateVariant" Value="no-runtime" Condition="'$(SelfContained)' != 'true'" />
+    <AssemblyMetadata Include="SingleFileBuild" Value="$(PublishSingleFile)" />
+  </ItemGroup>
 </Project>

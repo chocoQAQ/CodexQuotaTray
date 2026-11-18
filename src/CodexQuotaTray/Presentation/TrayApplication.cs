@@ -9,6 +9,9 @@ internal sealed class TrayApplication : ApplicationContext
 {
     private readonly QuotaMonitor monitor;
     private readonly StartupRegistration startup;
+    private readonly IUpdateClient updates;
+    private readonly Version installedVersion;
+    private readonly UpdateInstaller installer;
     private readonly TrayIcon tray = new();
     private readonly DetailsForm details = new();
     private readonly ContextMenuStrip menu = new();
@@ -22,11 +25,17 @@ internal sealed class TrayApplication : ApplicationContext
     private bool closing;
     private int visibilityAttempts;
     private Task? refreshTask;
+    private Task? updateTask;
+    private UpdateProgressForm? updateProgress;
 
-    public TrayApplication(QuotaMonitor monitor, StartupRegistration startup)
+    public TrayApplication(QuotaMonitor monitor, StartupRegistration startup, IUpdateClient updates,
+        Version installedVersion, UpdateInstaller installer, bool checkOnStartup)
     {
         this.monitor = monitor;
         this.startup = startup;
+        this.updates = updates;
+        this.installedVersion = installedVersion;
+        this.installer = installer;
         // 明确安装 WinForms 同步上下文，await 返回后只在 UI 线程更新窗口和图标。
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
         menu.Items.Add(statusItem);
@@ -53,6 +62,68 @@ internal sealed class TrayApplication : ApplicationContext
         Render();
         refreshTimer.Start();
         StartRefresh();
+        // 等消息循环启动后检查一次，网络等待不会阻塞托盘初始化。
+        if (checkOnStartup) Application.Idle += CheckUpdatesOnStartup;
+    }
+
+    private void CheckUpdatesOnStartup(object? sender, EventArgs args)
+    {
+        Application.Idle -= CheckUpdatesOnStartup;
+        if (!closing) updateTask = CheckUpdatesAsync();
+    }
+
+    private async Task CheckUpdatesAsync()
+    {
+        try
+        {
+            var result = await Task.Run(() => updates.CheckAsync(installedVersion, lifetime.Token));
+            if (closing) return;
+            if (result.Update is { } update && result.Status == UpdateCheckStatus.Available)
+            {
+                var answer = MessageBox.Show(
+                    $"发现新版本 v{update.Version}\n当前版本 v{installedVersion}\n\n是否立即下载并安装更新？\n安装完成后程序将自动重启。",
+                    "Codex 额度圆环 · 发现更新", MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information, MessageBoxDefaultButton.Button2);
+                if (answer == DialogResult.Yes && !closing) await InstallUpdateAsync(update);
+            }
+        }
+        catch (OperationCanceledException) when (closing) { }
+        catch (Exception) { /* 启动检查失败不打扰用户，下次启动再检查。 */ }
+    }
+
+    private async Task InstallUpdateAsync(AvailableUpdate update)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        using var window = new UpdateProgressForm();
+        updateProgress = window;
+        window.CancelRequested += () => cancellation.Cancel();
+        string? directory = null;
+        var launched = false;
+        try
+        {
+            directory = installer.CreateWorkDirectory();
+            window.Show();
+            using var http = UpdateDownloader.CreateHttpClient();
+            var progress = new Progress<UpdateProgress>(window.Report);
+            var prepared = await Task.Run(() => new UpdateDownloader(http).PrepareAsync(update, directory, progress, cancellation.Token));
+            cancellation.Token.ThrowIfCancellationRequested();
+            installer.Launch(prepared, update);
+            launched = true;
+            ExitThread();
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (Exception)
+        {
+            if (!closing) MessageBox.Show("自动更新未完成，当前版本仍可继续使用。请检查网络、磁盘空间及程序目录的写入权限，稍后重新启动程序再试。",
+                "Codex 额度圆环 · 更新失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            updateProgress = null;
+            window.AllowClose = true;
+            if (!window.IsDisposed) window.Close();
+            if (!launched && directory is not null) UpdateInstaller.DeleteWorkDirectory(directory);
+        }
     }
 
     private void StartRefresh()
@@ -150,17 +221,20 @@ internal sealed class TrayApplication : ApplicationContext
     {
         if (closing) return;
         closing = true;
+        Application.Idle -= CheckUpdatesOnStartup;
         refreshTimer.Stop();
         visibilityTimer.Stop();
         lifetime.Cancel();
+        if (updateProgress is not null) { updateProgress.AllowClose = true; updateProgress.Dispose(); }
         tray.Dispose();
         details.Dispose();
         menu.Dispose();
         refreshTimer.Dispose();
         visibilityTimer.Dispose();
         // 此处不能同步等待捕获 UI 上下文的任务，否则退出时会死锁。
-        if (refreshTask is { IsCompleted: false })
-            _ = refreshTask.ContinueWith(_ => lifetime.Dispose(), TaskScheduler.Default);
+        var pending = Task.WhenAll(new[] { refreshTask, updateTask }.OfType<Task>());
+        if (!pending.IsCompleted)
+            _ = pending.ContinueWith(_ => lifetime.Dispose(), TaskScheduler.Default);
         else lifetime.Dispose();
         base.ExitThreadCore();
     }

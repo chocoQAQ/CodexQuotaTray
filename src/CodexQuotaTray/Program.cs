@@ -13,14 +13,19 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         try
         {
+            if (args.Length == 2 && args[0] == "--apply-update") return UpdateInstaller.Apply(args[1]);
             string? home = null;
             string? diagnosis = null;
+            string? readyEvent = null;
+            var skipUpdateCheck = false;
             for (var i = 0; i < args.Length; i++)
             {
                 switch (args[i])
                 {
                     case "--codex-home" when i + 1 < args.Length: home = args[++i]; break;
                     case "--diagnose" when i + 1 < args.Length: diagnosis = args[++i]; break;
+                    case "--update-ready" when i + 1 < args.Length: readyEvent = args[++i]; break;
+                    case "--skip-update-check": skipUpdateCheck = true; break;
                     default: throw new ArgumentException("支持的参数：--codex-home <目录>、--diagnose <输出文件>。");
                 }
             }
@@ -50,7 +55,15 @@ internal static class Program
             }
             var startup = new StartupRegistration(Environment.ProcessPath ?? Application.ExecutablePath,
                 home is null ? [] : ["--codex-home", home]);
-            using var context = new TrayApplication(monitor, startup);
+            using var updateHttp = UpdateClient.CreateHttpClient();
+            var installedVersion = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
+            var installer = new UpdateInstaller(Environment.ProcessPath ?? Application.ExecutablePath,
+                home is null ? [] : ["--codex-home", home]);
+            UpdateInstaller.CleanupOldWorkDirectories();
+            using var context = new TrayApplication(monitor, startup,
+                new UpdateClient(updateHttp, UpdateInstaller.BuildVariant), installedVersion, installer,
+                !skipUpdateCheck && UpdateInstaller.IsSingleFileBuild);
+            if (readyEvent is not null) UpdateInstaller.SignalReady(readyEvent);
             Application.Run(context);
             return 0;
         }

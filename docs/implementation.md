@@ -79,6 +79,18 @@ ChatGPT-Account-Id: <account_id>
 
 `build.ps1 -Publish` 默认生成两个 win-x64 单文件版本及各自的 ZIP：`dist/CodexQuotaTray-self-contained` 包含运行时，`dist/CodexQuotaTray-no-runtime` 不包含运行时。无运行时版本需要目标系统安装 .NET 10 Desktop Runtime x64。使用 `-SelfContained` 或 `-FrameworkDependent` 可以单独发布其中一种。ZIP 只包含本次构建的 EXE 和 README，避免夹带本机诊断或其他遗留文件。
 
+## 更新检查
+
+发布的单文件程序正常启动后，在首次消息循环空闲时后台匿名请求本仓库的 `releases/latest`，每个实例仅检查一次，没有周期检查或手动检查入口。诊断、唤起已有实例及从源码运行的非单文件调试版本不检查。`UpdateClient` 使用独立 HttpClient，不访问 Codex 凭据或发送账号请求头，超时 10 秒、响应上限 256 KiB。它仅接受非草稿、非预发布的数字版本标签，兼容三段手工版本和四段 CD 版本，并按四段数字比较已安装程序集版本，避免把 `.10` 排到 `.9` 前面或把三段与 `.0` 误判为不同版本。
+
+有更新且附件完整时提示当前版本和新版本。用户确认后，按程序集中的 `UpdateVariant` 元数据选择相同的内置运行时/无运行时 ZIP；下载地址只接受本仓库的 Release 文件，重定向只允许 GitHub 和它的文件 CDN。`UpdateDownloader` 下载校验文件和 ZIP，核对大小及 SHA-256，再只提取固定名称的 `CodexQuotaTray.exe`，校验其版本资源。下载进度可见且可取消，下载失败或校验失败不替换当前文件。安装目录需要当前用户可写，不自动提权。
+
+`UpdateInstaller` 把当前单文件 EXE 复制到当前用户的 `%LOCALAPPDATA%\CodexQuotaTray\Updates\<GUID>`，以 `--apply-update` 模式启动临时更新进程，然后正常退出主程序。更新进程校验计划、等待原 PID 与启动时间对应的进程退出，在安装目录中准备同盘候选文件，再通过 `File.Replace` 原子替换并保留备份。新程序仍从原路径启动，保留显式的 `--codex-home`；自启注册表无需改写。
+
+更新进程用命名事件等待新程序初始化托盘后发送启动确认。收到确认才删除旧版备份；新程序启动失败或超时则结束自己启动的新进程，尝试恢复备份并重启旧版。回退启动仅跳过本次更新检查，避免失败后立即再次提示；下次正常启动仍会检查。临时更新进程在完成后退出，超过 30 分钟且不在使用的旧更新目录会在后续正常启动时清理。没有常驻更新服务或计划任务。
+
+启动检查遇到网络异常或 API 限流时安静结束，下次启动再检查。退出程序会取消在途查询或下载。更新检查与额度刷新相互独立。
+
 ## 自动发布
 
 `.github/workflows/release.yml` 在 `main` 每次 push 时触发，也支持 Actions 页面手动运行。Windows runner 安装 .NET 10，通过 `build.ps1 -Publish -Version <版本>` 运行测试、构建两个 ZIP，并生成 SHA-256 校验文件。版本号由 `Directory.Build.props` 的三段版本加 Actions 构建序号组成，如 `1.2.0.1`；工作流不提交版本修改，不产生触发循环。
