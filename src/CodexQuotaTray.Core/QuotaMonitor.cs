@@ -6,8 +6,10 @@ public interface ICodexActivity
 }
 
 /// <summary>查询、超时、重入保护和账号切换统一在此处理，与托盘 UI 解耦。</summary>
-public sealed class QuotaMonitor(ICodexActivity activity, ICredentialSource credentials, IUsageClient client)
+public sealed class QuotaMonitor(ICodexActivity activity, IQuotaSource source)
 {
+    public QuotaMonitor(ICodexActivity activity, ICredentialSource credentials, IUsageClient client)
+        : this(activity, new AuthFileQuotaSource(credentials, client)) { }
     public static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(1);
     private readonly SemaphoreSlim refreshGate = new(1, 1);
     private string? fingerprint;
@@ -26,20 +28,20 @@ public sealed class QuotaMonitor(ICodexActivity activity, ICredentialSource cred
             }
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(25));
-            var auth = await credentials.ReadAsync(timeout.Token);
-            if (fingerprint != auth.Fingerprint)
+            var connection = await source.ConnectAsync(timeout.Token);
+            if (fingerprint != connection.Identity)
             {
                 State = QuotaState.Initial;
-                fingerprint = auth.Fingerprint;
+                fingerprint = connection.Identity;
             }
-            var snapshot = await client.ReadAsync(auth, timeout.Token);
+            var snapshot = await connection.ReadAsync(timeout.Token);
             // 请求期间退出或换号时，丢弃旧响应，不把旧账号额度展示成当前额度。
             if (!activity.IsRunning())
                 return State = new(null, "等待 Codex 启动，每分钟自动检测。", false);
-            var current = await credentials.ReadAsync(timeout.Token);
-            if (current.Fingerprint != auth.Fingerprint)
+            var current = await source.ConnectAsync(timeout.Token);
+            if (current.Identity != connection.Identity)
                 return State = new(null, "Codex 登录状态已变化，下一分钟重新读取。", false);
-            return State = new(snapshot, "每 60 秒通过 HTTP 更新", false);
+            return State = new(snapshot, "已更新", false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {

@@ -13,7 +13,6 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         try
         {
-            if (args.Length == 2 && args[0] == "--apply-update") return UpdateInstaller.Apply(args[1]);
             string? home = null;
             string? diagnosis = null;
             string? readyEvent = null;
@@ -39,7 +38,14 @@ internal static class Program
             using var http = UsageClient.CreateHttpClient();
             using var sessions = new ActiveCodexSessionSource();
             ICredentialSource credentials = home is null ? new ActiveCredentialSource(sessions) : new FileCredentialSource(home);
-            var monitor = new QuotaMonitor(new CodexActivity(), credentials, new UsageClient(http));
+            var settings = new SettingsStore();
+            var preferences = settings.Load();
+            var activity = new CodexActivity();
+            var direct = new AuthFileQuotaSource(credentials, new UsageClient(http));
+            var server = new AppServerQuotaSource(sessions, home);
+            QuotaMonitor CreateMonitor(QuotaSourceKind kind) => new(activity,
+                kind == QuotaSourceKind.AppServer ? server : direct);
+            var monitor = CreateMonitor(preferences.Source);
             if (diagnosis is not null)
             {
                 var state = monitor.RefreshAsync(CancellationToken.None).GetAwaiter().GetResult();
@@ -57,13 +63,9 @@ internal static class Program
                 home is null ? [] : ["--codex-home", home]);
             using var updateHttp = UpdateClient.CreateHttpClient();
             var installedVersion = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
-            var installer = new UpdateInstaller(Environment.ProcessPath ?? Application.ExecutablePath,
-                home is null ? [] : ["--codex-home", home]);
-            UpdateInstaller.CleanupOldWorkDirectories();
-            using var context = new TrayApplication(monitor, startup,
-                new UpdateClient(updateHttp, UpdateInstaller.BuildVariant), installedVersion, installer,
-                !skipUpdateCheck && UpdateInstaller.IsSingleFileBuild);
-            if (readyEvent is not null) UpdateInstaller.SignalReady(readyEvent);
+            using var context = new TrayApplication(monitor, CreateMonitor, settings, preferences, startup,
+                new UpdateClient(updateHttp), installedVersion, !skipUpdateCheck);
+            if (readyEvent is not null) SignalLegacyUpdateReady(readyEvent);
             Application.Run(context);
             return 0;
         }
@@ -78,4 +80,13 @@ internal static class Program
             return 1;
         }
     }
+    // 兼容已发布的 v1.3.0.2 更新器的启动握手；此版本本身不下载或替换文件。
+    private static void SignalLegacyUpdateReady(string name)
+    {
+        const string prefix = @"Local\CodexQuotaTray.UpdateReady.";
+        if (!name.StartsWith(prefix, StringComparison.Ordinal) || !Guid.TryParseExact(name[prefix.Length..], "N", out _)) return;
+        try { using var ready = EventWaitHandle.OpenExisting(name); ready.Set(); }
+        catch (WaitHandleCannotBeOpenedException) { }
+    }
+
 }

@@ -2,8 +2,6 @@ using System.Net;
 using System.Text;
 using System.Diagnostics;
 using System.Text.Json;
-using System.IO.Compression;
-using System.Security.Cryptography;
 using CodexQuotaTray.Core;
 using CodexQuotaTray.Presentation;
 using CodexQuotaTray.Infrastructure;
@@ -43,151 +41,80 @@ internal static class Program
         }
         try
         {
-            await Test("自动更新匹配当前运行时版本，拒绝缺失文件和外部下载地址", async () =>
+            await Test("app-server 多额度桶、分钟窗口和旧响应兼容", () =>
             {
-                using var noRuntime = new HttpClient(new Handler((_, _) => Task.FromResult(Response(HttpStatusCode.OK, ReleasePayload("v9.0.0", "no-runtime")))));
-                var result = await new UpdateClient(noRuntime, "no-runtime").CheckAsync(new Version(1, 0, 0), default);
-                Equal(UpdateCheckStatus.Available, result.Status);
-                Check(result.Update!.ArchiveName.EndsWith("-no-runtime.zip", StringComparison.Ordinal));
-                Equal(UpdateCheckStatus.Unavailable, (await new UpdateClient(noRuntime).CheckAsync(new Version(1, 0, 0), default)).Status);
-                foreach (var body in new[] {
-                    ReleasePayload("v9.0.0", archiveUrl: "https://example.com/program.zip"),
-                    """{"tag_name":"v9.0.0","draft":false,"prerelease":false,"assets":[]}"""
-                })
-                {
-                    using var http = new HttpClient(new Handler((_, _) => Task.FromResult(Response(HttpStatusCode.OK, body))));
-                    Equal(UpdateCheckStatus.Unavailable, (await new UpdateClient(http).CheckAsync(new Version(1, 0, 0), default)).Status);
-                }
+                using var result = JsonDocument.Parse("""
+                    {"rateLimits":{"primary":{"usedPercent":99}},"rateLimitsByLimitId":{
+                      "codex":{"primary":{"usedPercent":22,"windowDurationMins":300,"resetsAt":1800009000},
+                        "secondary":{"usedPercent":68,"windowDurationMins":10080,"resetsAt":1800302400}},
+                      "review":{"limitName":"Code review","primary":{"usedPercent":101,"resetsAt":-1}}}}
+                    """);
+                var snapshot = AppServerUsageParser.Parse(result.RootElement, Now);
+                Equal(3, snapshot.Windows.Count);
+                Equal(32d, snapshot.MainWindow!.RemainingPercent);
+                Equal(18000d, snapshot.Windows[0].WindowSeconds);
+                Equal(0d, snapshot.Windows[2].RemainingPercent);
+                Equal(null, snapshot.Windows[2].ResetsAt);
+                using var legacy = JsonDocument.Parse("""{"rateLimits":{"primary":{"usedPercent":25}}}""");
+                Equal(75d, AppServerUsageParser.Parse(legacy.RootElement, Now).MainWindow!.RemainingPercent);
+                return Task.CompletedTask;
             });
-            await Test("下载、校验 ZIP 并仅提取程序到指定目录", async () =>
+            await Test("app-server 握手只查询账号和额度，忽略通知并拒绝宿主请求", async () =>
             {
-                var bytes = TestArchive();
-                var update = FixtureUpdate(bytes.Length);
-                var hash = Convert.ToHexString(SHA256.HashData(bytes));
-                using var http = new HttpClient(new Handler((request, _) =>
-                {
-                    Check(request.Headers.Authorization is null && !request.Headers.Contains("ChatGPT-Account-Id"));
-                    return Task.FromResult(request.RequestUri == update.ChecksumsUrl
-                        ? Response(HttpStatusCode.OK, hash + "  " + update.ArchiveName + "\n")
-                        : BytesResponse(bytes));
-                }));
-                var directory = TemporaryDirectory();
+                var input = AppServerFixture(extra: """
+                    {"method":"account/updated","params":{}}
+                    {"id":"host-request","method":"account/chatgptAuthTokens/refresh","params":{}}
+                    """);
+                using var output = new StringWriter();
+                var result = await new AppServerProtocol(new StringReader(input), output).ReadQuotaAsync(default);
+                Equal(75d, result.MainWindow!.RemainingPercent);
+                var messages = output.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(x => JsonDocument.Parse(x)).ToArray();
                 try
                 {
-                    var prepared = await new UpdateDownloader(http).PrepareAsync(update, directory, null, default);
-                    Equal(Path.Combine(directory, "CodexQuotaTray.exe"), prepared.ExecutablePath);
-                    Equal("test-executable", await File.ReadAllTextAsync(prepared.ExecutablePath));
-                    Equal(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("test-executable"))), prepared.Sha256);
-                    Check(!File.Exists(Path.Combine(directory, "README.md")));
+                    var methods = messages.Where(x => x.RootElement.TryGetProperty("method", out _))
+                        .Select(x => x.RootElement.GetProperty("method").GetString()).ToArray();
+                    Equal("initialize,initialized,account/read,account/rateLimits/read,account/read", string.Join(',', methods));
+                    Check(messages.Any(x => x.RootElement.TryGetProperty("error", out var error) && error.GetProperty("code").GetInt32() == -32601));
+                    Check(!output.ToString().Contains("access_token"));
                 }
-                finally { Directory.Delete(directory, true); }
+                finally { foreach (var message in messages) message.Dispose(); }
             });
-            await Test("校验错误和下载不完整时绝不提取更新程序", async () =>
+            await Test("app-server 换号、未登录及异常响应不展示旧账号数据", async () =>
             {
-                var bytes = TestArchive();
-                foreach (var wrongHash in new[] { true, false })
+                foreach (var input in new[] { AppServerFixture(changed: true),
+                    """{"id":1,"result":{}}\n{"id":2,"result":{"account":null}}\n""".Replace("\\n", "\n"),
+                    """{"id":1,"error":{"message":"private-response"}}""" + "\n", "" })
                 {
-                    var update = FixtureUpdate(bytes.Length + (wrongHash ? 0 : 1));
-                    using var http = new HttpClient(new Handler((request, _) => Task.FromResult(request.RequestUri == update.ChecksumsUrl
-                        ? Response(HttpStatusCode.OK, new string('0', 64) + "  " + update.ArchiveName + "\n")
-                        : BytesResponse(bytes))));
-                    var directory = TemporaryDirectory();
-                    try
-                    {
-                        await Throws<InvalidDataException>(() => new UpdateDownloader(http).PrepareAsync(update, directory, null, default));
-                        Check(!File.Exists(Path.Combine(directory, "CodexQuotaTray.exe")));
-                    }
-                    finally { Directory.Delete(directory, true); }
+                    using var output = new StringWriter();
+                    var error = await Throws<QuotaException>(() => new AppServerProtocol(new StringReader(input), output).ReadQuotaAsync(default));
+                    Check(error.ClearSnapshot && !error.Message.Contains("private-response"));
                 }
             });
-            await Test("更新 ZIP 路径穿越被拒绝", async () =>
+            await Test("app-server 限制响应体并支持取消", async () =>
             {
-                var bytes = TestArchive("../outside.exe");
-                var update = FixtureUpdate(bytes.Length);
-                var hash = Convert.ToHexString(SHA256.HashData(bytes));
-                using var http = new HttpClient(new Handler((request, _) => Task.FromResult(request.RequestUri == update.ChecksumsUrl
-                    ? Response(HttpStatusCode.OK, hash + "  " + update.ArchiveName)
-                    : BytesResponse(bytes))));
-                var directory = TemporaryDirectory();
+                using var output = new StringWriter();
+                await Throws<QuotaException>(() => new AppServerProtocol(new StringReader(new string('x', 1024 * 1024 + 1)), output).ReadQuotaAsync(default));
+                using var cancel = new CancellationTokenSource();
+                cancel.Cancel();
+                await Throws<OperationCanceledException>(() => new AppServerProtocol(new StringReader(AppServerFixture()), output).ReadQuotaAsync(cancel.Token));
+            });
+            await Test("数据来源偏好持久化，损坏设置回退默认值", () =>
+            {
+                var directory = Path.Combine(Path.GetTempPath(), "CodexQuotaTray-settings-" + Guid.NewGuid());
+                var path = Path.Combine(directory, "settings.json");
+                var store = new SettingsStore(path);
                 try
                 {
-                    await Throws<InvalidDataException>(() => new UpdateDownloader(http).PrepareAsync(update, directory, null, default));
-                    Check(!File.Exists(Path.Combine(directory, "CodexQuotaTray.exe")));
+                    Equal(QuotaSourceKind.AuthFile, store.Load().Source);
+                    store.Save(new AppSettings(QuotaSourceKind.AppServer));
+                    Equal(QuotaSourceKind.AppServer, store.Load().Source);
+                    File.WriteAllText(path, "{broken");
+                    Equal(QuotaSourceKind.AuthFile, store.Load().Source);
+                    File.WriteAllText(path, """{"Source":99}""");
+                    Equal(QuotaSourceKind.AuthFile, store.Load().Source);
                 }
-                finally { Directory.Delete(directory, true); }
-            });
-            await Test("校验文件必须唯一匹配当前安装包", async () =>
-            {
-                var name = FixtureUpdate(1).ArchiveName;
-                var hash = new string('a', 64);
-                Equal(hash, UpdateDownloader.ParseChecksum("\uFEFF" + hash + "  " + name + "\r\n", name));
-                Equal(hash, UpdateDownloader.ParseChecksum(hash + " *" + name, name));
-                foreach (var text in new[] { hash + "  other.zip", "bad-hash  " + name, hash + "  " + name + "\n" + hash + "  " + name })
-                    await Throws<InvalidDataException>(() => Task.FromResult(UpdateDownloader.ParseChecksum(text, name)));
-            });
-            await Test("下载重定向仅允许 GitHub 及其文件 CDN", async () =>
-            {
-                var calls = 0;
-                using var http = new HttpClient(new Handler((_, _) =>
-                {
-                    calls++;
-                    var response = Response(HttpStatusCode.Redirect, "");
-                    response.Headers.Location = new Uri("https://example.com/update.zip");
-                    return Task.FromResult(response);
-                }));
-                var directory = TemporaryDirectory();
-                try
-                {
-                    await Throws<InvalidDataException>(() => new UpdateDownloader(http).PrepareAsync(FixtureUpdate(1), directory, null, default));
-                    Equal(1, calls);
-                }
-                finally { Directory.Delete(directory, true); }
-            });
-            await Test("用户取消下载不生成安装程序", async () =>
-            {
-                using var http = new HttpClient(new Handler(async (_, token) =>
-                {
-                    await Task.Delay(Timeout.Infinite, token);
-                    return BytesResponse([]);
-                }));
-                var directory = TemporaryDirectory();
-                try
-                {
-                    using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
-                    await Throws<OperationCanceledException>(() => new UpdateDownloader(http).PrepareAsync(FixtureUpdate(1), directory, null, cancel.Token));
-                    Check(!File.Exists(Path.Combine(directory, "CodexQuotaTray.exe")));
-                }
-                finally { Directory.Delete(directory, true); }
-            });
-            await Test("更新文件替换可回滚，确认提交后清理备份", async () =>
-            {
-                var directory = TemporaryDirectory();
-                try
-                {
-                    var target = Path.Combine(directory, "CodexQuotaTray.exe");
-                    var candidate = Path.Combine(directory, "new.exe");
-                    await File.WriteAllTextAsync(target, "old-program");
-                    await File.WriteAllTextAsync(candidate, "new-program");
-                    var hash = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(candidate)));
-                    using (var transaction = new UpdateFileTransaction(target, candidate, hash))
-                    {
-                        transaction.Install();
-                        Equal("new-program", await File.ReadAllTextAsync(target));
-                        transaction.Rollback();
-                        Equal("old-program", await File.ReadAllTextAsync(target));
-                    }
-                    using (var transaction = new UpdateFileTransaction(target, candidate, hash))
-                    {
-                        transaction.Install();
-                        transaction.Commit();
-                    }
-                    Equal("new-program", await File.ReadAllTextAsync(target));
-                    Check(!Directory.GetFiles(directory).Any(path => path.Contains(".backup-") || path.Contains(".incoming-")));
-                    using var corrupt = new UpdateFileTransaction(target, candidate, new string('0', 64));
-                    await Throws<InvalidDataException>(() => { corrupt.Install(); return Task.CompletedTask; });
-                    Equal("new-program", await File.ReadAllTextAsync(target));
-                }
-                finally { Directory.Delete(directory, true); }
+                finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+                return Task.CompletedTask;
             });
             await Test("更新版本号兼容三/四段、数字顺序和无效标签", () =>
             {
@@ -655,43 +582,14 @@ internal static class Program
     }
     private static HttpResponseMessage Response(HttpStatusCode status, string text) => new(status)
     { Content = new StringContent(text, Encoding.UTF8, "application/json") };
-    private static string ReleasePayload(string tag, string variant = "self-contained", string? archiveUrl = null)
-    {
-        var number = tag.TrimStart('v', 'V');
-        var name = $"CodexQuotaTray-{number}-win-x64-{variant}.zip";
-        var prefix = "https://github.com/chocoQAQ/CodexQuotaTray/releases/download/" + tag + "/";
-        return JsonSerializer.Serialize(new { tag_name = tag, draft = false, prerelease = false,
-            html_url = "https://example.com/untrusted",
-            assets = new[] {
-                new { name, browser_download_url = archiveUrl ?? prefix + name, size = 500 },
-                new { name = "SHA256SUMS.txt", browser_download_url = prefix + "SHA256SUMS.txt", size = 200 }
-            } });
-    }
-    private static string TemporaryDirectory()
-    {
-        var path = Path.Combine(Path.GetTempPath(), "CodexQuotaTray-update-test-" + Guid.NewGuid());
-        Directory.CreateDirectory(path);
-        return path;
-    }
-    private static AvailableUpdate FixtureUpdate(long size) => new(new Version(9, 0, 0, 1),
-        new Uri("https://github.com/chocoQAQ/CodexQuotaTray/releases/tag/v9.0.0.1"),
-        "CodexQuotaTray-9.0.0.1-win-x64-no-runtime.zip",
-        new Uri("https://github.com/chocoQAQ/CodexQuotaTray/releases/download/v9.0.0.1/CodexQuotaTray-9.0.0.1-win-x64-no-runtime.zip"),
-        new Uri("https://github.com/chocoQAQ/CodexQuotaTray/releases/download/v9.0.0.1/SHA256SUMS.txt"), size);
-    private static HttpResponseMessage BytesResponse(byte[] bytes) => new(HttpStatusCode.OK) { Content = new ByteArrayContent(bytes) };
-    private static byte[] TestArchive(string? extra = null)
-    {
-        using var memory = new MemoryStream();
-        using (var zip = new ZipArchive(memory, ZipArchiveMode.Create, true))
-        {
-            foreach (var name in new[] { "CodexQuotaTray.exe", "README.md" }.Concat(extra is null ? [] : new[] { extra }))
-            {
-                using var writer = new StreamWriter(zip.CreateEntry(name).Open());
-                writer.Write(name == "CodexQuotaTray.exe" ? "test-executable" : "test-readme");
-            }
-        }
-        return memory.ToArray();
-    }
+    private static string AppServerFixture(bool changed = false, string extra = "") =>
+        "{\"id\":1,\"result\":{}}\n" + extra + "\n" +
+        "{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\",\"email\":\"test@example.invalid\"}}}\n" +
+        "{\"id\":3,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":25}}}}\n" +
+        "{\"id\":4,\"result\":{\"account\":{\"type\":\"chatgpt\",\"email\":\"" +
+        (changed ? "different@example.invalid" : "test@example.invalid") + "\"}}}\n";
+    private static string ReleasePayload(string tag) => JsonSerializer.Serialize(new {
+        tag_name = tag, draft = false, prerelease = false, html_url = "https://example.com/untrusted" });
     private sealed class Handler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> send) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => send(request, cancellationToken);
