@@ -106,8 +106,19 @@ internal static class Program
                 try
                 {
                     Equal(QuotaSourceKind.AuthFile, store.Load().Source);
+                    Check(store.Load().CheckForUpdatesOnStartup);
+                    Directory.CreateDirectory(directory);
+                    File.WriteAllText(path, """{"Source":"AppServer"}""");
+                    Equal(QuotaSourceKind.AppServer, store.Load().Source);
+                    Check(store.Load().CheckForUpdatesOnStartup); // 兼容缺少新字段的旧设置。
+                    store.Save(store.Load() with { CheckForUpdatesOnStartup = false });
+                    Check(!store.Load().CheckForUpdatesOnStartup);
+                    Equal(QuotaSourceKind.AppServer, store.Load().Source);
+                    store.Save(store.Load() with { Source = QuotaSourceKind.AuthFile });
+                    Check(!store.Load().CheckForUpdatesOnStartup); // 切换来源不重置更新偏好。
                     store.Save(new AppSettings(QuotaSourceKind.AppServer));
                     Equal(QuotaSourceKind.AppServer, store.Load().Source);
+                    Check(store.Load().CheckForUpdatesOnStartup);
                     File.WriteAllText(path, "{broken");
                     Equal(QuotaSourceKind.AuthFile, store.Load().Source);
                     File.WriteAllText(path, """{"Source":99}""");

@@ -19,6 +19,8 @@ internal sealed class DetailsForm : Form
     private readonly Panel sourceRow = new() { Height = 44, Padding = new Padding(0, 4, 0, 8), Margin = Padding.Empty };
     private readonly CheckBox startup = new() { Text = "开机自启", AutoSize = true,
         Margin = new Padding(0, 12, 0, 12), AutoCheck = false };
+    private readonly CheckBox updateCheck = new() { Text = "启动时检查更新", AutoSize = true,
+        Margin = new Padding(20, 12, 0, 12), AutoCheck = false };
     private readonly MaterialButton refresh;
     private QuotaSnapshot? shownSnapshot;
     private bool shownStale;
@@ -28,6 +30,7 @@ internal sealed class DetailsForm : Form
     public event Action? RefreshRequested;
     public event Action<QuotaSourceKind>? SourceRequested;
     public event Action? StartupRequested;
+    public event Action? UpdateCheckRequested;
     public event Action? RepositoryRequested;
     public event Action? TaskbarSettingsRequested;
 
@@ -70,7 +73,11 @@ internal sealed class DetailsForm : Form
         sourceHelp = Label("", theme.OnSurfaceVariant);
         body.Controls.Add(sourceHelp);
         startup.Click += (_, _) => StartupRequested?.Invoke();
-        body.Controls.Add(startup);
+        updateCheck.Click += (_, _) => UpdateCheckRequested?.Invoke();
+        var options = new FlowLayoutPanel { AutoSize = true, WrapContents = true, Margin = Padding.Empty };
+        options.Controls.Add(startup);
+        options.Controls.Add(updateCheck);
+        body.Controls.Add(options);
         body.Controls.Add(Link("托盘显示设置", () => TaskbarSettingsRequested?.Invoke()));
         body.Controls.Add(Label($"v{typeof(DetailsForm).Assembly.GetName().Version}", theme.OnSurfaceVariant,
             margin: new Padding(0, 20, 0, 4)));
@@ -85,7 +92,7 @@ internal sealed class DetailsForm : Form
         ResizeRows();
     }
 
-    public void SetSettings(QuotaSourceKind kind, bool startupEnabled, bool busy, bool startupAvailable = true)
+    public void SetSettings(QuotaSourceKind kind, bool startupEnabled, bool checkForUpdates, bool busy, bool startupAvailable = true)
     {
         changingSettings = true;
         settingsBusy = busy;
@@ -93,6 +100,8 @@ internal sealed class DetailsForm : Form
         source.Enabled = !busy;
         startup.Checked = startupEnabled;
         startup.Enabled = !busy && startupAvailable;
+        updateCheck.Checked = checkForUpdates;
+        updateCheck.Enabled = !busy;
         sourceHelp.Text = kind == QuotaSourceKind.AuthFile
             ? "读取本机 auth.json，直接查询官方接口。"
             : "由本机 Codex 查询额度，需可共享的登录状态。";

@@ -4,7 +4,8 @@ using CodexQuotaTray.Core;
 
 namespace CodexQuotaTray.Infrastructure;
 
-public sealed record AppSettings(QuotaSourceKind Source = QuotaSourceKind.AuthFile);
+// 新增字段默认开启，旧版只保存 Source 的设置文件保持原有启动检查行为。
+public sealed record AppSettings(QuotaSourceKind Source = QuotaSourceKind.AuthFile, bool CheckForUpdatesOnStartup = true);
 
 /// <summary>仅保存用户偏好，不复制或保存任何 Codex 凭据。</summary>
 public sealed class SettingsStore(string? path = null)

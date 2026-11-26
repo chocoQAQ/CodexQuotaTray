@@ -3,6 +3,10 @@ name: Build and release
 on:
   push:
     branches: [main]
+    # 仅修改使用说明或文档时不构建；混合代码改动仍会触发。
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
   workflow_dispatch:
 
 # 默认只读；只有发布 job 可以创建标签、上传 Release 附件。
@@ -109,11 +113,20 @@ jobs:
           sha256sum --check SHA256SUMS.txt
           cd ..
 
-          # 如果 main 已更新，留给新构建发布，避免旧构建覆盖“最新版”。
+          # 后续若仅有文档提交，不会触发新构建，应允许本次代码版本完成发布。
+          # 若包含代码改动或比较结果可能被截断，则留给新构建，避免旧版覆盖 Latest。
           current_head=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
           if [[ "$current_head" != "$RELEASE_COMMIT" ]]; then
-            echo 'main 已有更新，此次构建不发布。'
-            exit 0
+            comparison=$(gh api "repos/$GH_REPO/compare/$RELEASE_COMMIT...$current_head")
+            if ! jq -e '
+              def documentation: . == "README.md" or startswith("docs/");
+              .status == "ahead" and (.files | type) == "array" and (.files | length) < 300 and
+              all(.files[]; (.filename | documentation) and
+                ((.previous_filename // .filename) | documentation))
+            ' <<< "$comparison" > /dev/null; then
+              echo 'main 已有代码更新或无法确认差异，此次构建不发布。'
+              exit 0
+            fi
           fi
 
           tag="v$RELEASE_VERSION"

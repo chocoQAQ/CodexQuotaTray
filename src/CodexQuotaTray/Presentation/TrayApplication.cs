@@ -21,6 +21,7 @@ internal sealed class TrayApplication : ApplicationContext
     private readonly System.Windows.Forms.Timer refreshTimer = new() { Interval = (int)QuotaMonitor.RefreshInterval.TotalMilliseconds };
     private readonly System.Windows.Forms.Timer visibilityTimer = new() { Interval = 1000 };
     private readonly CancellationTokenSource lifetime = new();
+    private readonly CancellationTokenSource updateCancellation = new();
     private CancellationTokenSource? refreshCancellation;
     private bool refreshing;
     private bool closing;
@@ -52,6 +53,7 @@ internal sealed class TrayApplication : ApplicationContext
         tray.Registered += () => { visibilityAttempts = 0; visibilityTimer.Start(); };
         details.RefreshRequested += StartRefresh;
         details.StartupRequested += ToggleStartup;
+        details.UpdateCheckRequested += ToggleUpdateCheck;
         details.SourceRequested += kind => { if (!closing && !changingSource) settingsTask = ChangeSourceAsync(kind); };
         details.RepositoryRequested += () => OpenLink("https://github.com/chocoQAQ/CodexQuotaTray");
         details.TaskbarSettingsRequested += () => OpenLink("ms-settings:taskbar");
@@ -65,28 +67,29 @@ internal sealed class TrayApplication : ApplicationContext
         refreshTimer.Start();
         StartRefresh();
         // 首次空闲即注销事件：每次真正启动仅检查一次，刷新额度和打开窗口都不触发检查。
-        if (checkOnStartup) Application.Idle += CheckUpdatesOnStartup;
+        if (checkOnStartup && preferences.CheckForUpdatesOnStartup) Application.Idle += CheckUpdatesOnStartup;
     }
 
     private void CheckUpdatesOnStartup(object? sender, EventArgs args)
     {
         Application.Idle -= CheckUpdatesOnStartup;
-        if (!closing) updateTask = CheckUpdatesAsync();
+        if (!closing && preferences.CheckForUpdatesOnStartup) updateTask = CheckUpdatesAsync();
     }
 
     private async Task CheckUpdatesAsync()
     {
         try
         {
-            var result = await Task.Run(() => updates.CheckAsync(installedVersion, lifetime.Token));
-            if (closing || result.Status != UpdateCheckStatus.Available || result.Update is not { } update) return;
+            var result = await Task.Run(() => updates.CheckAsync(installedVersion, updateCancellation.Token));
+            if (closing || updateCancellation.IsCancellationRequested || !preferences.CheckForUpdatesOnStartup ||
+                result.Status != UpdateCheckStatus.Available || result.Update is not { } update) return;
             var answer = MessageBox.Show(
                 $"发现新版本 v{update.Version}\n当前版本 v{installedVersion}\n\n是否打开 GitHub 发行页面？",
                 "CodexQuotaTray · 发现更新", MessageBoxButtons.YesNo,
                 MessageBoxIcon.Information, MessageBoxDefaultButton.Button2);
             if (answer == DialogResult.Yes && !closing) OpenLink(update.ReleasePage.AbsoluteUri);
         }
-        catch (OperationCanceledException) when (closing) { }
+        catch (OperationCanceledException) when (updateCancellation.IsCancellationRequested) { }
         catch (Exception) { /* 网络失败不打扰用户，下次启动再检查。 */ }
     }
 
@@ -178,9 +181,33 @@ internal sealed class TrayApplication : ApplicationContext
 
     private void UpdateSettings()
     {
-        try { details.SetSettings(preferences.Source, startup.IsEnabled(), changingSource); }
+        try { details.SetSettings(preferences.Source, startup.IsEnabled(), preferences.CheckForUpdatesOnStartup, changingSource); }
         catch (Exception error) when (error is UnauthorizedAccessException or SecurityException or IOException)
-        { details.SetSettings(preferences.Source, false, changingSource, false); }
+        { details.SetSettings(preferences.Source, false, preferences.CheckForUpdatesOnStartup, changingSource, false); }
+    }
+
+    private void ToggleUpdateCheck()
+    {
+        if (closing || changingSource) return;
+        try
+        {
+            var next = preferences with { CheckForUpdatesOnStartup = !preferences.CheckForUpdatesOnStartup };
+            // 写入成功后才改变开关；与来源切换互斥，避免两个偏好保存相互覆盖。
+            settings.Save(next);
+            preferences = next;
+            if (!next.CheckForUpdatesOnStartup)
+            {
+                Application.Idle -= CheckUpdatesOnStartup;
+                updateCancellation.Cancel();
+            }
+            // 开启不立即联网、不重新注册 Idle；仍然只在下次启动检查一次。
+        }
+        catch (Exception error) when (error is UnauthorizedAccessException or SecurityException or IOException)
+        {
+            MessageBox.Show("无法保存更新检查设置，请检查当前用户的设置目录权限。",
+                "CodexQuotaTray", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        UpdateSettings();
     }
 
     private void ToggleStartup()
@@ -202,6 +229,7 @@ internal sealed class TrayApplication : ApplicationContext
         refreshTimer.Stop();
         visibilityTimer.Stop();
         lifetime.Cancel();
+        updateCancellation.Cancel();
         tray.Dispose();
         details.Dispose();
         menu.Dispose();
@@ -209,8 +237,8 @@ internal sealed class TrayApplication : ApplicationContext
         visibilityTimer.Dispose();
         // UI 退出不同步阻塞等待异步任务，避免死锁。
         var pending = Task.WhenAll(new[] { refreshTask, updateTask, settingsTask }.OfType<Task>());
-        if (!pending.IsCompleted) _ = pending.ContinueWith(_ => lifetime.Dispose(), TaskScheduler.Default);
-        else lifetime.Dispose();
+        if (!pending.IsCompleted) _ = pending.ContinueWith(_ => { lifetime.Dispose(); updateCancellation.Dispose(); }, TaskScheduler.Default);
+        else { lifetime.Dispose(); updateCancellation.Dispose(); }
         base.ExitThreadCore();
     }
 }

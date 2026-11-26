@@ -70,7 +70,9 @@ RPC 响应总量限制为 1 Mi 字符，stderr 只排空不保存，宿主请求
 
 ## 启动检查更新
 
-首个 `Application.Idle` 后匿名请求本仓库 GitHub Latest Release，并立即注销事件，每次正常启动只检查一次。诊断、重复唤起已有实例不检查；无定时检查或手动检查按钮。
+主窗口提供“启动时检查更新”开关，默认开启，保存在 settings.json 的 `CheckForUpdatesOnStartup` 中。旧设置缺少该字段时保持开启。关闭后不发起启动检查，并取消尚未完成的请求；重新开启从下次启动生效，不立即联网。
+
+开启时，首个 `Application.Idle` 后匿名请求本仓库 GitHub Latest Release，并立即注销事件，每次正常启动只检查一次。诊断、重复唤起已有实例不检查；无定时检查或手动检查按钮。
 
 `UpdateClient` 使用独立 HttpClient，不发送 Codex 凭据。超时 10 秒，响应上限 256 KiB，只接受非草稿、非预发布的数字版本，按三段/四段数字比较。
 
@@ -82,7 +84,9 @@ RPC 响应总量限制为 1 Mi 字符，stderr 只排空不保存，宿主请求
 
 `build.ps1 -Publish` 执行离线检查并生成两个 win-x64 单文件 ZIP：内置运行时版和无运行时版。后者需要 .NET 10 Desktop Runtime x64。ZIP 只包含 EXE 与 README。
 
-`.github/workflows/release.yml` 在 main 更新后运行：Windows 构建和检查 → 两个 ZIP 与 SHA-256 校验文件 → 上传草稿 → 附件齐全后公开为 Latest。版本为项目三段版本加 Actions 构建序号。工作流固定官方 Action 提交，只授予发布 job 写权限；若 main 已更新，旧构建不会覆盖 Latest。
+`.github/workflows/release.yml` 对 main 的 push 使用 `paths-ignore`：全部改动都位于根目录 `README.md` 或 `docs/**` 时跳过；包含其他路径时照常构建。手动触发仍可发布。
+
+流水线为 Windows 构建和检查 → 两个 ZIP 与 SHA-256 校验文件 → 上传草稿 → 附件齐全后公开为 Latest。版本为项目三段版本加 Actions 构建序号。工作流固定官方 Action 提交，只授予发布 job 写权限。发布前若 main 已变化，会检查后续差异；仅有文档变更时继续发布已构建的代码，包含代码变更时跳过。比较结果达到 300 个文件或无法确认时保守停止，可再手动触发。
 
 离线检查使用模拟账号和协议数据，覆盖额度解析、进程识别、切换竞态、取消、匿名更新检查及图标回归，不读取真实账号。实际桌面交互与登录兼容性由用户验收。
 
