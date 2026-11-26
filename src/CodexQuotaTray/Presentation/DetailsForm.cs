@@ -21,6 +21,8 @@ internal sealed class DetailsForm : Form
         Margin = new Padding(0, 12, 0, 12), AutoCheck = false };
     private readonly CheckBox updateCheck = new() { Text = "启动时检查更新", AutoSize = true,
         Margin = new Padding(20, 12, 0, 12), AutoCheck = false };
+    private readonly CheckBox codexStartup = new() { Text = "随 Codex 桌面端启动（测试）", AutoSize = true,
+        Margin = new Padding(0, 0, 0, 12), AutoCheck = false, Enabled = false };
     private readonly MaterialButton refresh;
     private QuotaSnapshot? shownSnapshot;
     private bool shownStale;
@@ -31,6 +33,7 @@ internal sealed class DetailsForm : Form
     public event Action<QuotaSourceKind>? SourceRequested;
     public event Action? StartupRequested;
     public event Action? UpdateCheckRequested;
+    public event Action? CodexStartupRequested;
     public event Action? RepositoryRequested;
     public event Action? TaskbarSettingsRequested;
 
@@ -78,10 +81,16 @@ internal sealed class DetailsForm : Form
         options.Controls.Add(startup);
         options.Controls.Add(updateCheck);
         body.Controls.Add(options);
+        codexStartup.Click += (_, _) => CodexStartupRequested?.Invoke();
+        body.Controls.Add(codexStartup);
         body.Controls.Add(Link("托盘显示设置", () => TaskbarSettingsRequested?.Invoke()));
-        body.Controls.Add(Label($"v{typeof(DetailsForm).Assembly.GetName().Version}", theme.OnSurfaceVariant,
-            margin: new Padding(0, 20, 0, 4)));
-        body.Controls.Add(Link("github.com/chocoQAQ/CodexQuotaTray", () => RepositoryRequested?.Invoke()));
+        var footer = new FlowLayoutPanel { AutoSize = true, WrapContents = true, Margin = new Padding(0, 8, 0, 0) };
+        footer.Controls.Add(Label($"v{typeof(DetailsForm).Assembly.GetName().Version}", theme.OnSurfaceVariant,
+            margin: new Padding(0, 4, 16, 4)));
+        var repository = Link("github.com/chocoQAQ/CodexQuotaTray", () => RepositoryRequested?.Invoke());
+        repository.Margin = new Padding(0, 4, 0, 4);
+        footer.Controls.Add(repository);
+        body.Controls.Add(footer);
         FormClosing += (_, e) =>
         {
             if (e.CloseReason != CloseReason.UserClosing) return;
@@ -106,6 +115,14 @@ internal sealed class DetailsForm : Form
             ? "读取本机 auth.json，直接查询官方接口。"
             : "由本机 Codex 查询额度，需可共享的登录状态。";
         changingSettings = false;
+    }
+
+    public void SetCodexStartup(bool enabled, bool busy, bool available)
+    {
+        codexStartup.Checked = enabled;
+        codexStartup.Enabled = !busy && available;
+        codexStartup.Text = busy ? "随 Codex 桌面端启动（处理中…）" : available
+            ? "随 Codex 桌面端启动（测试）" : "随 Codex 桌面端启动（任务计划不可用）";
     }
 
     public void Render(QuotaState state, bool refreshing)

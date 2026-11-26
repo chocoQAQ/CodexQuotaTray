@@ -66,7 +66,17 @@ RPC 响应总量限制为 1 Mi 字符，stderr 只排空不保存，宿主请求
 
 ## 开机自启
 
-主窗口“开机自启”默认关闭。`StartupRegistration` 只操作 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 中本程序的值，保留显式 `--codex-home`，正确引用带空格或引号的参数。写入成功后才勾选，不申请管理员权限。移动程序前先关闭，移动后再开启。跟随 ChatGPT/Codex 启动的实验功能本版本未加入，没有任务计划或监听进程。
+主窗口“开机自启”默认关闭。`StartupRegistration` 只操作 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 中本程序的值，保留显式 `--codex-home`，正确引用带空格或引号的参数。写入成功后才勾选，不申请管理员权限。移动程序前先关闭，移动后再开启。
+
+## 随 Codex 桌面端启动（测试）
+
+默认关闭，与开机自启独立。`CodexStartupRegistration` 使用 Windows 任务计划 COM 接口，在当前用户 SID 对应的任务中订阅 `Microsoft-Windows-AppModel-Runtime/Admin` 事件 201，限定 `ApplicationName=OpenAI.Codex_2p2nqsd0c76g0!App`、`Message=[LaunchProcess]`，排除命令执行辅助进程。任务直接执行圆环 EXE，并通过 `ValueQueries` 传入事件的目标 PID。
+
+`CodexStartupProcess` 以有限查询权限核对目标进程的应用 ID、用户和会话。目标退出、不可读或不匹配时静默结束；已有圆环实例时不弹窗、不重复检查更新。首次启动仍遵守“启动时检查更新”开关。
+
+没有额外监听进程、轮询任务或 PowerShell 脚本；托盘未运行时，触发工作交给 Windows 已有服务。任务仅在用户已登录时运行，不保存密码、不要求最高权限、不唤醒电脑、不受电池状态或默认三天执行时限限制。打开窗口时异步读取任务状态，点击开关时注册/删除任务，不在每分钟刷新中访问任务服务。
+
+仅支持当前已验证的打包版 Codex 桌面端，不支持纯 CLI 或普通 ChatGPT。依赖上游包标识、事件格式和系统日志/任务服务；不自动启用日志或进程审计，权限不足会提示失败。关闭选项只删除任务，不退出圆环；Codex 退出也不会关闭圆环。移动程序后需重新开关注册。方案比较和验收步骤见 [架构与代价](architecture-and-tradeoffs.md#91-随-codex-桌面端启动测试)。
 
 ## 启动检查更新
 

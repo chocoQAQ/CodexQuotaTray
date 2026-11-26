@@ -40,7 +40,7 @@ public sealed class StartupRegistration(string executable, IReadOnlyList<string>
         return string.Join(" ", new[] { executable }.Concat(arguments).Select(QuoteArgument));
     }
 
-    private static string QuoteArgument(string argument)
+    internal static string QuoteArgument(string argument)
     {
         if (argument.Contains('\0')) throw new ArgumentException("自启参数包含无效字符。");
         // 按 Windows argv 规则引用每个参数：正确处理空格、引号及末尾反斜线。

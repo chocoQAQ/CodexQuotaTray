@@ -12,6 +12,10 @@ internal sealed class TrayApplication : ApplicationContext
     private readonly SettingsStore settings;
     private AppSettings preferences;
     private readonly StartupRegistration startup;
+    private readonly CodexStartupRegistration codexStartup;
+    private bool codexStartupEnabled;
+    private bool codexStartupBusy;
+    private Task? codexStartupTask;
     private readonly IUpdateClient updates;
     private readonly Version installedVersion;
     private readonly TrayIcon tray = new();
@@ -32,7 +36,8 @@ internal sealed class TrayApplication : ApplicationContext
     private Task? settingsTask;
 
     public TrayApplication(QuotaMonitor monitor, Func<QuotaSourceKind, QuotaMonitor> createMonitor,
-        SettingsStore settings, AppSettings preferences, StartupRegistration startup, IUpdateClient updates,
+        SettingsStore settings, AppSettings preferences, StartupRegistration startup,
+        CodexStartupRegistration codexStartup, IUpdateClient updates,
         Version installedVersion, bool checkOnStartup)
     {
         this.monitor = monitor;
@@ -40,6 +45,7 @@ internal sealed class TrayApplication : ApplicationContext
         this.settings = settings;
         this.preferences = preferences;
         this.startup = startup;
+        this.codexStartup = codexStartup;
         this.updates = updates;
         this.installedVersion = installedVersion;
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
@@ -54,6 +60,10 @@ internal sealed class TrayApplication : ApplicationContext
         details.RefreshRequested += StartRefresh;
         details.StartupRequested += ToggleStartup;
         details.UpdateCheckRequested += ToggleUpdateCheck;
+        details.CodexStartupRequested += () =>
+        {
+            if (!closing && !codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(!codexStartupEnabled);
+        };
         details.SourceRequested += kind => { if (!closing && !changingSource) settingsTask = ChangeSourceAsync(kind); };
         details.RepositoryRequested += () => OpenLink("https://github.com/chocoQAQ/CodexQuotaTray");
         details.TaskbarSettingsRequested += () => OpenLink("ms-settings:taskbar");
@@ -167,6 +177,36 @@ internal sealed class TrayApplication : ApplicationContext
         details.Show();
         details.WindowState = FormWindowState.Normal;
         details.Activate();
+        // 仅打开设置时读取任务状态，正常额度轮询不连接任务计划服务。
+        if (!codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(null);
+    }
+
+    private async Task UpdateCodexStartupAsync(bool? enabled)
+    {
+        codexStartupBusy = true;
+        details.SetCodexStartup(codexStartupEnabled, true, true);
+        var available = false;
+        try
+        {
+            codexStartupEnabled = await Task.Run(() =>
+            {
+                if (enabled is { } value) codexStartup.SetEnabled(value);
+                return codexStartup.IsEnabled();
+            });
+            available = true;
+        }
+        catch (Exception)
+        {
+            if (!closing && enabled is not null)
+                MessageBox.Show("无法更改随 Codex 启动设置。请检查任务计划服务、事件日志和当前用户权限。\n" +
+                    "此功能不会自动启用日志或请求管理员权限。重新打开窗口可重试。",
+                    "CodexQuotaTray", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            codexStartupBusy = false;
+            if (!closing) details.SetCodexStartup(codexStartupEnabled, false, available);
+        }
     }
 
     private static void OpenLink(string link)
@@ -236,7 +276,7 @@ internal sealed class TrayApplication : ApplicationContext
         refreshTimer.Dispose();
         visibilityTimer.Dispose();
         // UI 退出不同步阻塞等待异步任务，避免死锁。
-        var pending = Task.WhenAll(new[] { refreshTask, updateTask, settingsTask }.OfType<Task>());
+        var pending = Task.WhenAll(new[] { refreshTask, updateTask, settingsTask, codexStartupTask }.OfType<Task>());
         if (!pending.IsCompleted) _ = pending.ContinueWith(_ => { lifetime.Dispose(); updateCancellation.Dispose(); }, TaskScheduler.Default);
         else { lifetime.Dispose(); updateCancellation.Dispose(); }
         base.ExitThreadCore();

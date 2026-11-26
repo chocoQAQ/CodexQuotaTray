@@ -17,6 +17,7 @@ internal static class Program
             string? diagnosis = null;
             string? readyEvent = null;
             var skipUpdateCheck = false;
+            int? codexStarted = null;
             for (var i = 0; i < args.Length; i++)
             {
                 switch (args[i])
@@ -25,14 +26,19 @@ internal static class Program
                     case "--diagnose" when i + 1 < args.Length: diagnosis = args[++i]; break;
                     case "--update-ready" when i + 1 < args.Length: readyEvent = args[++i]; break;
                     case "--skip-update-check": skipUpdateCheck = true; break;
+                    case "--codex-started" when i + 1 < args.Length:
+                        if (!int.TryParse(args[++i], out var processId)) return 0;
+                        codexStarted = processId;
+                        break;
                     default: throw new ArgumentException("支持的参数：--codex-home <目录>、--diagnose <输出文件>。");
                 }
             }
             if (home is not null) home = Path.GetFullPath(home);
+            if (codexStarted is { } pid && !CodexStartupProcess.IsCurrentUserDesktop(pid)) return 0;
             using var singleInstance = new SingleInstance();
             if (!singleInstance.IsFirst)
             {
-                SingleInstance.ShowExisting();
+                if (codexStarted is null) SingleInstance.ShowExisting();
                 return 0;
             }
             using var http = UsageClient.CreateHttpClient();
@@ -61,9 +67,11 @@ internal static class Program
             }
             var startup = new StartupRegistration(Environment.ProcessPath ?? Application.ExecutablePath,
                 home is null ? [] : ["--codex-home", home]);
+            var codexStartup = new CodexStartupRegistration(Environment.ProcessPath ?? Application.ExecutablePath,
+                home is null ? [] : ["--codex-home", home]);
             using var updateHttp = UpdateClient.CreateHttpClient();
             var installedVersion = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
-            using var context = new TrayApplication(monitor, CreateMonitor, settings, preferences, startup,
+            using var context = new TrayApplication(monitor, CreateMonitor, settings, preferences, startup, codexStartup,
                 new UpdateClient(updateHttp), installedVersion, !skipUpdateCheck);
             if (readyEvent is not null) SignalLegacyUpdateReady(readyEvent);
             Application.Run(context);

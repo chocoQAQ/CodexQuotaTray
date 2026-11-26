@@ -6,6 +6,8 @@ using CodexQuotaTray.Core;
 using CodexQuotaTray.Presentation;
 using CodexQuotaTray.Infrastructure;
 using Microsoft.Win32;
+using System.Xml.Linq;
+using System.Xml.XPath;
 
 namespace CodexQuotaTray.Tests;
 
@@ -565,6 +567,61 @@ internal static class Program
                     using var icon = RingRenderer.CreateIcon(45, 25, false);
                     Check(icon.Handle != IntPtr.Zero);
                 }
+                return Task.CompletedTask;
+            });
+            await Test("Codex 启动事件只匹配桌面启动，排除辅助进程和其他应用", () =>
+            {
+                bool Matches(string app, string message, int id = 201, string provider = "Microsoft-Windows-AppModel-Runtime")
+                {
+                    var eventXml = new XElement("Event",
+                        new XElement("System", new XElement("Provider", new XAttribute("Name", provider)), new XElement("EventID", id)),
+                        new XElement("EventData", new XElement("Data", new XAttribute("Name", "ApplicationName"), app),
+                            new XElement("Data", new XAttribute("Name", "Message"), message)));
+                    return new XDocument(eventXml).XPathSelectElement(CodexStartupRegistration.EventFilter) is not null;
+                }
+                Check(Matches(CodexStartupRegistration.ApplicationId, "[LaunchProcess]"));
+                Check(!Matches("OpenAI.Codex_2p2nqsd0c76g0!CodexCoreCommandRunner", "[LaunchProcess]"));
+                Check(!Matches(CodexStartupRegistration.ApplicationId, "[FinishPackageActivation]"));
+                Check(!Matches("Other.App!App", "[LaunchProcess]"));
+                Check(!Matches(CodexStartupRegistration.ApplicationId, "[LaunchProcess]", 202));
+                Check(!Matches(CodexStartupRegistration.ApplicationId, "[LaunchProcess]", provider: "Other"));
+                return Task.CompletedTask;
+            });
+            await Test("任务 XML 使用当前用户交互令牌，正确引用路径且没有周期触发", () =>
+            {
+                const string executable = @"C:\测试 & apps\CodexQuotaTray.exe";
+                const string home = "C:\\测试 & home\\末尾\\";
+                const string sid = "S-1-5-21-100-200-300-1001";
+                var xml = XDocument.Parse(CodexStartupRegistration.BuildTaskXml(executable, ["--codex-home", home], sid));
+                XNamespace ns = xml.Root!.Name.Namespace;
+                string Value(string name) => xml.Descendants(ns + name).Single().Value;
+                Equal(executable, Value("Command"));
+                Equal(sid, Value("UserId"));
+                Equal("InteractiveToken", Value("LogonType"));
+                Equal("LeastPrivilege", Value("RunLevel"));
+                Equal("IgnoreNew", Value("MultipleInstancesPolicy"));
+                Equal("PT0S", Value("ExecutionTimeLimit"));
+                Equal("false", Value("WakeToRun"));
+                Equal("false", Value("DisallowStartIfOnBatteries"));
+                Equal("false", Value("StopIfGoingOnBatteries"));
+                Equal("EventTrigger", xml.Descendants(ns + "Triggers").Single().Elements().Single().Name.LocalName);
+                var query = XDocument.Parse(Value("Subscription")).Descendants("Select").Single();
+                Equal(CodexStartupRegistration.EventLog, query.Attribute("Path")!.Value);
+                Equal(CodexStartupRegistration.EventFilter, query.Value);
+                Equal("Event/EventData/Data[@Name='ProcessID']", Value("Value"));
+                var args = ProcessParametersReader.SplitArguments("app.exe " + Value("Arguments").Replace("$(CodexProcessId)", "1234"));
+                Equal("--codex-home", args[1]);
+                Equal(home, args[2]);
+                Equal("--codex-started", args[3]);
+                Equal("1234", args[4]);
+                return Task.CompletedTask;
+            });
+            await Test("事件启动拒绝无效 PID 和普通进程", () =>
+            {
+                Check(!CodexStartupProcess.IsCurrentUserDesktop(0));
+                Check(!CodexStartupProcess.IsCurrentUserDesktop(-1));
+                Check(!CodexStartupProcess.IsCurrentUserDesktop(int.MaxValue));
+                Check(!CodexStartupProcess.IsCurrentUserDesktop(Environment.ProcessId));
                 return Task.CompletedTask;
             });
             Console.WriteLine($"PASS: {passed} test groups");
