@@ -21,7 +21,7 @@ internal sealed class DetailsForm : Form
         Margin = new Padding(0, 12, 0, 12), AutoCheck = false };
     private readonly CheckBox updateCheck = new() { Text = "启动时检查更新", AutoSize = true,
         Margin = new Padding(20, 12, 0, 12), AutoCheck = false };
-    private readonly CheckBox codexStartup = new() { Text = "随 Codex 桌面端启动（测试）", AutoSize = true,
+    private readonly CheckBox codexStartup = new() { Text = "随 Codex 桌面端启动和退出（测试）", AutoSize = true,
         Margin = new Padding(0, 0, 0, 12), AutoCheck = false, Enabled = false };
     private readonly MaterialButton refresh;
     private QuotaSnapshot? shownSnapshot;
@@ -121,8 +121,8 @@ internal sealed class DetailsForm : Form
     {
         codexStartup.Checked = enabled;
         codexStartup.Enabled = !busy && available;
-        codexStartup.Text = busy ? "随 Codex 桌面端启动（处理中…）" : available
-            ? "随 Codex 桌面端启动（测试）" : "随 Codex 桌面端启动（任务计划不可用）";
+        codexStartup.Text = busy ? "随 Codex 桌面端启动和退出（处理中…）" : available
+            ? "随 Codex 桌面端启动和退出（测试）" : "随 Codex 桌面端启动和退出（任务计划不可用）";
     }
 
     public void Render(QuotaState state, bool refreshing)

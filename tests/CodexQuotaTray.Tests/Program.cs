@@ -624,6 +624,92 @@ internal static class Program
                 Check(!CodexStartupProcess.IsCurrentUserDesktop(Environment.ProcessId));
                 return Task.CompletedTask;
             });
+            await Test("跟随退出：未见桌面进程或查询不完整时保留圆环", async () =>
+            {
+                var reads = 0;
+                var monitor = new CodexExitMonitor(readDesktop: () => { reads++; return new(null, true); });
+                Check(!await monitor.WaitForExitAsync(default));
+                Equal(1, reads);
+                var uncertain = new CodexExitMonitor(true, () => new(null, false), _ => throw new Exception("不应进入退出宽限期"));
+                Check(!await uncertain.WaitForExitAsync(default));
+                var confirmed = new CodexExitMonitor(true, () => new(null, true), _ => Task.CompletedTask);
+                Check(await confirmed.WaitForExitAsync(default));
+                confirmed.Reset();
+                Check(!await confirmed.WaitForExitAsync(default));
+            });
+            await Test("跟随退出：等待真实进程通知，最后一个实例退出才结束", async () =>
+            {
+                using var first = await StartExitFixtureAsync();
+                using var second = await StartExitFixtureAsync();
+                try
+                {
+                    var attached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var secondAttached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var reads = 0;
+                    var monitor = new CodexExitMonitor(readDesktop: () =>
+                    {
+                        var count = Interlocked.Increment(ref reads);
+                        if (count == 1)
+                        {
+                            var snapshot = new CodexDesktopSnapshot(Process.GetProcessById(first.Id), true);
+                            attached.SetResult();
+                            return snapshot;
+                        }
+                        if (count == 2)
+                        {
+                            var snapshot = new CodexDesktopSnapshot(Process.GetProcessById(second.Id), true);
+                            secondAttached.SetResult();
+                            return snapshot;
+                        }
+                        return new(null, true);
+                    }, restartGrace: _ => Task.CompletedTask);
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    var waiting = monitor.WaitForExitAsync(timeout.Token);
+                    await attached.Task.WaitAsync(timeout.Token);
+                    Check(!waiting.IsCompleted);
+                    Equal(1, Volatile.Read(ref reads));
+                    await first.StandardInput.WriteLineAsync();
+                    await secondAttached.Task.WaitAsync(timeout.Token);
+                    Check(!waiting.IsCompleted);
+                    await second.StandardInput.WriteLineAsync();
+                    Check(await waiting);
+                    Equal(4, reads);
+                }
+                finally { await StopExitFixtureAsync(first); await StopExitFixtureAsync(second); }
+            });
+            await Test("跟随退出：取消不结束宿主，宽限期重启会继续等待", async () =>
+            {
+                using var child = await StartExitFixtureAsync();
+                try
+                {
+                    var attached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var resumedAttached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var reads = 0;
+                    var monitor = new CodexExitMonitor(true, () =>
+                    {
+                        var count = Interlocked.Increment(ref reads);
+                        if (count == 1) return new(null, true);
+                        var snapshot = child.HasExited ? new CodexDesktopSnapshot(null, true)
+                            : new CodexDesktopSnapshot(Process.GetProcessById(child.Id), true);
+                        attached.TrySetResult();
+                        if (count == 3) resumedAttached.SetResult();
+                        return snapshot;
+                    }, _ => Task.CompletedTask);
+                    using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    var waiting = monitor.WaitForExitAsync(cancel.Token);
+                    await attached.Task.WaitAsync(cancel.Token);
+                    Check(!waiting.IsCompleted);
+                    cancel.Cancel();
+                    await Throws<OperationCanceledException>(() => waiting);
+                    Check(!child.HasExited);
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    var resumed = monitor.WaitForExitAsync(timeout.Token);
+                    await resumedAttached.Task.WaitAsync(timeout.Token);
+                    await child.StandardInput.WriteLineAsync();
+                    Check(await resumed);
+                }
+                finally { await StopExitFixtureAsync(child); }
+            });
             Console.WriteLine($"PASS: {passed} test groups");
             return 0;
         }
@@ -632,6 +718,31 @@ internal static class Program
             Console.Error.WriteLine(error);
             return 1;
         }
+    }
+
+    private static async Task<Process> StartExitFixtureAsync()
+    {
+        var start = new ProcessStartInfo(Environment.ProcessPath!)
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardInput = true, RedirectStandardOutput = true
+        };
+        start.ArgumentList.Add("--process-fixture");
+        var process = Process.Start(start)!;
+        try
+        {
+            Equal("ready", await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+            return process;
+        }
+        catch { await StopExitFixtureAsync(process); process.Dispose(); throw; }
+    }
+
+    private static async Task StopExitFixtureAsync(Process process)
+    {
+        if (process.HasExited) return;
+        await process.StandardInput.WriteLineAsync();
+        try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+        catch (TimeoutException) { process.Kill(); await process.WaitForExitAsync(); }
     }
 
     private static async Task Test(string name, Func<Task> action)

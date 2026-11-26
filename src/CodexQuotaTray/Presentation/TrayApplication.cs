@@ -16,6 +16,9 @@ internal sealed class TrayApplication : ApplicationContext
     private bool codexStartupEnabled;
     private bool codexStartupBusy;
     private Task? codexStartupTask;
+    private readonly CodexExitMonitor codexExit;
+    private Task? codexExitTask;
+    private CancellationTokenSource? codexExitCancellation;
     private readonly IUpdateClient updates;
     private readonly Version installedVersion;
     private readonly TrayIcon tray = new();
@@ -38,7 +41,7 @@ internal sealed class TrayApplication : ApplicationContext
     public TrayApplication(QuotaMonitor monitor, Func<QuotaSourceKind, QuotaMonitor> createMonitor,
         SettingsStore settings, AppSettings preferences, StartupRegistration startup,
         CodexStartupRegistration codexStartup, IUpdateClient updates,
-        Version installedVersion, bool checkOnStartup)
+        Version installedVersion, bool checkOnStartup, bool startedByCodex = false)
     {
         this.monitor = monitor;
         this.createMonitor = createMonitor;
@@ -46,6 +49,7 @@ internal sealed class TrayApplication : ApplicationContext
         this.preferences = preferences;
         this.startup = startup;
         this.codexStartup = codexStartup;
+        codexExit = new CodexExitMonitor(startedByCodex);
         this.updates = updates;
         this.installedVersion = installedVersion;
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
@@ -78,6 +82,13 @@ internal sealed class TrayApplication : ApplicationContext
         StartRefresh();
         // 首次空闲即注销事件：每次真正启动仅检查一次，刷新额度和打开窗口都不触发检查。
         if (checkOnStartup && preferences.CheckForUpdatesOnStartup) Application.Idle += CheckUpdatesOnStartup;
+        Application.Idle += InitializeCodexStartup;
+    }
+
+    private void InitializeCodexStartup(object? sender, EventArgs args)
+    {
+        Application.Idle -= InitializeCodexStartup;
+        if (!closing && !codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(null);
     }
 
     private void CheckUpdatesOnStartup(object? sender, EventArgs args)
@@ -134,6 +145,7 @@ internal sealed class TrayApplication : ApplicationContext
 
     private void StartRefresh()
     {
+        StartFollowingCodex();
         if (closing || refreshing || changingSource) return;
         refreshTask = RefreshAsync();
     }
@@ -177,13 +189,14 @@ internal sealed class TrayApplication : ApplicationContext
         details.Show();
         details.WindowState = FormWindowState.Normal;
         details.Activate();
-        // 仅打开设置时读取任务状态，正常额度轮询不连接任务计划服务。
+        // 启动和打开设置时读取任务状态，正常额度轮询不连接任务计划服务。
         if (!codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(null);
     }
 
     private async Task UpdateCodexStartupAsync(bool? enabled)
     {
         codexStartupBusy = true;
+        if (enabled is not null) codexExitCancellation?.Cancel();
         details.SetCodexStartup(codexStartupEnabled, true, true);
         var available = false;
         try
@@ -193,6 +206,10 @@ internal sealed class TrayApplication : ApplicationContext
                 if (enabled is { } value) codexStartup.SetEnabled(value);
                 return codexStartup.IsEnabled();
             });
+            if (!codexStartupEnabled) codexExitCancellation?.Cancel();
+            if (codexExitCancellation?.IsCancellationRequested == true && codexExitTask is not null)
+                await codexExitTask;
+            if (!codexStartupEnabled) codexExit.Reset();
             available = true;
         }
         catch (Exception)
@@ -206,7 +223,31 @@ internal sealed class TrayApplication : ApplicationContext
         {
             codexStartupBusy = false;
             if (!closing) details.SetCodexStartup(codexStartupEnabled, false, available);
+            if (available) StartFollowingCodex();
         }
+    }
+
+    private void StartFollowingCodex()
+    {
+        if (closing || codexStartupBusy || !codexStartupEnabled || codexExitTask is { IsCompleted: false }) return;
+        codexExitTask = FollowCodexAsync();
+    }
+
+    private async Task FollowCodexAsync()
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        codexExitCancellation = cancellation;
+        try
+        {
+            if (!await codexExit.WaitForExitAsync(cancellation.Token)) return;
+            // 退出前再确认任务未在程序外被关闭/删除；失败时保留圆环。
+            var enabled = await Task.Run(codexStartup.IsEnabled, cancellation.Token);
+            if (!closing && !codexStartupBusy && codexStartupEnabled && enabled && !cancellation.IsCancellationRequested)
+                ExitThread();
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (Exception) { /* 进程或任务状态不可确认时保留运行，已有分钟刷新稍后重试。 */ }
+        finally { codexExitCancellation = null; }
     }
 
     private static void OpenLink(string link)
@@ -266,6 +307,7 @@ internal sealed class TrayApplication : ApplicationContext
         if (closing) return;
         closing = true;
         Application.Idle -= CheckUpdatesOnStartup;
+        Application.Idle -= InitializeCodexStartup;
         refreshTimer.Stop();
         visibilityTimer.Stop();
         lifetime.Cancel();
@@ -276,7 +318,7 @@ internal sealed class TrayApplication : ApplicationContext
         refreshTimer.Dispose();
         visibilityTimer.Dispose();
         // UI 退出不同步阻塞等待异步任务，避免死锁。
-        var pending = Task.WhenAll(new[] { refreshTask, updateTask, settingsTask, codexStartupTask }.OfType<Task>());
+        var pending = Task.WhenAll(new[] { refreshTask, updateTask, settingsTask, codexStartupTask, codexExitTask }.OfType<Task>());
         if (!pending.IsCompleted) _ = pending.ContinueWith(_ => { lifetime.Dispose(); updateCancellation.Dispose(); }, TaskScheduler.Default);
         else { lifetime.Dispose(); updateCancellation.Dispose(); }
         base.ExitThreadCore();

@@ -72,7 +72,7 @@ internal static class Program
             using var updateHttp = UpdateClient.CreateHttpClient();
             var installedVersion = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
             using var context = new TrayApplication(monitor, CreateMonitor, settings, preferences, startup, codexStartup,
-                new UpdateClient(updateHttp), installedVersion, !skipUpdateCheck);
+                new UpdateClient(updateHttp), installedVersion, !skipUpdateCheck, codexStarted is not null);
             if (readyEvent is not null) SignalLegacyUpdateReady(readyEvent);
             Application.Run(context);
             return 0;

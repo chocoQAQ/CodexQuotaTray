@@ -11,6 +11,10 @@ namespace CodexQuotaTray.Infrastructure;
 public static class CodexStartupProcess
 {
     public static bool IsCurrentUserDesktop(int processId)
+        => InspectCurrentUserDesktop(processId) == true;
+
+    /// <summary>null 表示权限或系统查询失败，不能据此认定 Codex 已退出。</summary>
+    public static bool? InspectCurrentUserDesktop(int processId)
     {
         if (processId <= 0) return false;
         try
@@ -19,20 +23,23 @@ public static class CodexStartupProcess
             using var self = Process.GetCurrentProcess();
             if (process.SessionId != self.SessionId) return false;
             using var handle = OpenProcess(0x1000, false, processId); // QUERY_LIMITED_INFORMATION
-            if (handle.IsInvalid) return false;
+            if (handle.IsInvalid) return Marshal.GetLastWin32Error() == 87 ? false : null;
             var length = 512u;
             var id = new StringBuilder((int)length);
-            if (GetApplicationUserModelId(handle, ref length, id) != 0 ||
-                id.ToString() != CodexStartupRegistration.ApplicationId) return false;
-            if (!OpenProcessToken(handle, 0x0008, out var token)) return false;
+            var result = GetApplicationUserModelId(handle, ref length, id);
+            if (result is 15700 or 15703) return false; // 未打包进程或没有应用标识。
+            if (result != 0) return null;
+            if (id.ToString() != CodexStartupRegistration.ApplicationId) return false;
+            if (!OpenProcessToken(handle, 0x0008, out var token)) return null;
             using (token)
             using (var owner = new WindowsIdentity(token.DangerousGetHandle()))
             using (var current = WindowsIdentity.GetCurrent())
                 return owner.User == current.User && !process.HasExited;
         }
-        catch (Exception error) when (error is ArgumentException or InvalidOperationException or Win32Exception or
-            UnauthorizedAccessException or System.Security.SecurityException)
-        { return false; } // 进程已退出或不可读时静默忽略，不读取凭据。
+        catch (Exception error) when (error is ArgumentException or InvalidOperationException)
+        { return false; } // 目标已退出。
+        catch (Exception error) when (error is Win32Exception or UnauthorizedAccessException or System.Security.SecurityException)
+        { return null; }
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
