@@ -1,3 +1,5 @@
+using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Net;
 using System.Text;
 using System.Diagnostics;
@@ -128,6 +130,170 @@ internal static class Program
                 }
                 finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
                 return Task.CompletedTask;
+            });
+            await Test("自动更新匹配当前运行时版本，拒绝缺失文件和外部下载地址", async () =>
+            {
+                using var noRuntime = new HttpClient(new Handler((_, _) => Task.FromResult(Response(HttpStatusCode.OK, ReleasePayload("v9.0.0", "no-runtime")))));
+                var result = await new UpdateClient(noRuntime, "no-runtime").CheckAsync(new Version(1, 0, 0), default);
+                Equal(UpdateCheckStatus.Available, result.Status);
+                Check(result.Update!.ArchiveName.EndsWith("-no-runtime.zip", StringComparison.Ordinal));
+                Equal(UpdateCheckStatus.Unavailable, (await new UpdateClient(noRuntime).CheckAsync(new Version(1, 0, 0), default)).Status);
+                foreach (var body in new[] {
+                    ReleasePayload("v9.0.0", archiveUrl: "https://example.com/program.zip"),
+                    """{"tag_name":"v9.0.0","draft":false,"prerelease":false,"assets":[]}"""
+                })
+                {
+                    using var http = new HttpClient(new Handler((_, _) => Task.FromResult(Response(HttpStatusCode.OK, body))));
+                    Equal(UpdateCheckStatus.Unavailable, (await new UpdateClient(http).CheckAsync(new Version(1, 0, 0), default)).Status);
+                }
+            });
+            await Test("下载、校验 ZIP 并仅提取程序到指定目录", async () =>
+            {
+                var bytes = TestArchive();
+                var update = FixtureUpdate(bytes.Length);
+                var hash = Convert.ToHexString(SHA256.HashData(bytes));
+                using var http = new HttpClient(new Handler((request, _) =>
+                {
+                    Check(request.Headers.Authorization is null && !request.Headers.Contains("ChatGPT-Account-Id"));
+                    return Task.FromResult(request.RequestUri == update.ChecksumsUrl
+                        ? Response(HttpStatusCode.OK, hash + "  " + update.ArchiveName + "\n")
+                        : BytesResponse(bytes));
+                }));
+                var directory = TemporaryDirectory();
+                try
+                {
+                    var prepared = await new UpdateDownloader(http).PrepareAsync(update, directory, null, default);
+                    Equal(Path.Combine(directory, "CodexQuotaTray.exe"), prepared.ExecutablePath);
+                    Equal("test-executable", await File.ReadAllTextAsync(prepared.ExecutablePath));
+                    Equal(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("test-executable"))), prepared.Sha256);
+                    Check(!File.Exists(Path.Combine(directory, "README.md")));
+                }
+                finally { Directory.Delete(directory, true); }
+            });
+            await Test("校验错误和下载不完整时绝不提取更新程序", async () =>
+            {
+                var bytes = TestArchive();
+                foreach (var wrongHash in new[] { true, false })
+                {
+                    var update = FixtureUpdate(bytes.Length + (wrongHash ? 0 : 1));
+                    using var http = new HttpClient(new Handler((request, _) => Task.FromResult(request.RequestUri == update.ChecksumsUrl
+                        ? Response(HttpStatusCode.OK, new string('0', 64) + "  " + update.ArchiveName + "\n")
+                        : BytesResponse(bytes))));
+                    var directory = TemporaryDirectory();
+                    try
+                    {
+                        await Throws<InvalidDataException>(() => new UpdateDownloader(http).PrepareAsync(update, directory, null, default));
+                        Check(!File.Exists(Path.Combine(directory, "CodexQuotaTray.exe")));
+                    }
+                    finally { Directory.Delete(directory, true); }
+                }
+            });
+            await Test("更新 ZIP 路径穿越被拒绝", async () =>
+            {
+                var bytes = TestArchive("../outside.exe");
+                var update = FixtureUpdate(bytes.Length);
+                var hash = Convert.ToHexString(SHA256.HashData(bytes));
+                using var http = new HttpClient(new Handler((request, _) => Task.FromResult(request.RequestUri == update.ChecksumsUrl
+                    ? Response(HttpStatusCode.OK, hash + "  " + update.ArchiveName)
+                    : BytesResponse(bytes))));
+                var directory = TemporaryDirectory();
+                try
+                {
+                    await Throws<InvalidDataException>(() => new UpdateDownloader(http).PrepareAsync(update, directory, null, default));
+                    Check(!File.Exists(Path.Combine(directory, "CodexQuotaTray.exe")));
+                }
+                finally { Directory.Delete(directory, true); }
+            });
+            await Test("校验文件必须唯一匹配当前安装包", async () =>
+            {
+                var name = FixtureUpdate(1).ArchiveName;
+                var hash = new string('a', 64);
+                Equal(hash, UpdateDownloader.ParseChecksum("\uFEFF" + hash + "  " + name + "\r\n", name));
+                Equal(hash, UpdateDownloader.ParseChecksum(hash + " *" + name, name));
+                foreach (var text in new[] { hash + "  other.zip", "bad-hash  " + name, hash + "  " + name + "\n" + hash + "  " + name })
+                    await Throws<InvalidDataException>(() => Task.FromResult(UpdateDownloader.ParseChecksum(text, name)));
+            });
+            await Test("下载重定向仅允许 GitHub 及其文件 CDN", async () =>
+            {
+                var calls = 0;
+                using var http = new HttpClient(new Handler((_, _) =>
+                {
+                    calls++;
+                    var response = Response(HttpStatusCode.Redirect, "");
+                    response.Headers.Location = new Uri("https://example.com/update.zip");
+                    return Task.FromResult(response);
+                }));
+                var directory = TemporaryDirectory();
+                try
+                {
+                    await Throws<InvalidDataException>(() => new UpdateDownloader(http).PrepareAsync(FixtureUpdate(1), directory, null, default));
+                    Equal(1, calls);
+                }
+                finally { Directory.Delete(directory, true); }
+            });
+            await Test("用户取消下载不生成安装程序", async () =>
+            {
+                using var http = new HttpClient(new Handler(async (_, token) =>
+                {
+                    await Task.Delay(Timeout.Infinite, token);
+                    return BytesResponse([]);
+                }));
+                var directory = TemporaryDirectory();
+                try
+                {
+                    using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+                    await Throws<OperationCanceledException>(() => new UpdateDownloader(http).PrepareAsync(FixtureUpdate(1), directory, null, cancel.Token));
+                    Check(!File.Exists(Path.Combine(directory, "CodexQuotaTray.exe")));
+                }
+                finally { Directory.Delete(directory, true); }
+            });
+            await Test("更新文件替换可回滚，确认提交后清理备份", async () =>
+            {
+                var directory = TemporaryDirectory();
+                try
+                {
+                    var target = Path.Combine(directory, "CodexQuotaTray.exe");
+                    var candidate = Path.Combine(directory, "new.exe");
+                    await File.WriteAllTextAsync(target, "old-program");
+                    await File.WriteAllTextAsync(candidate, "new-program");
+                    var hash = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(candidate)));
+                    using (var transaction = new UpdateFileTransaction(target, candidate, hash))
+                    {
+                        transaction.Install();
+                        Equal("new-program", await File.ReadAllTextAsync(target));
+                        transaction.Rollback();
+                        Equal("old-program", await File.ReadAllTextAsync(target));
+                    }
+                    using (var transaction = new UpdateFileTransaction(target, candidate, hash))
+                    {
+                        transaction.Install();
+                        transaction.Commit();
+                    }
+                    Equal("new-program", await File.ReadAllTextAsync(target));
+                    Check(!Directory.GetFiles(directory).Any(path => path.Contains(".backup-") || path.Contains(".incoming-")));
+                    using var corrupt = new UpdateFileTransaction(target, candidate, new string('0', 64));
+                    await Throws<InvalidDataException>(() => { corrupt.Install(); return Task.CompletedTask; });
+                    Equal("new-program", await File.ReadAllTextAsync(target));
+                }
+                finally { Directory.Delete(directory, true); }
+            });
+            await Test("目标文件占用时保留旧版并清理待替换文件", async () =>
+            {
+                var directory = TemporaryDirectory();
+                var target = Path.Combine(directory, "CodexQuotaTray.exe");
+                var candidate = Path.Combine(directory, "candidate.exe");
+                try
+                {
+                    await File.WriteAllTextAsync(target, "old-program");
+                    await File.WriteAllTextAsync(candidate, "new-program");
+                    var hash = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(candidate)));
+                    using (var occupied = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    using (var transaction = new UpdateFileTransaction(target, candidate, hash))
+                        await Throws<IOException>(() => { transaction.Install(); return Task.CompletedTask; });
+                    Equal("old-program", await File.ReadAllTextAsync(target));
+                    Check(!Directory.GetFiles(directory).Any(path => path.Contains(".incoming-") || path.Contains(".backup-")));
+                }
+                finally { Directory.Delete(directory, true); }
             });
             await Test("更新版本号兼容三/四段、数字顺序和无效标签", () =>
             {
@@ -767,8 +933,43 @@ internal static class Program
         "{\"id\":3,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":25}}}}\n" +
         "{\"id\":4,\"result\":{\"account\":{\"type\":\"chatgpt\",\"email\":\"" +
         (changed ? "different@example.invalid" : "test@example.invalid") + "\"}}}\n";
-    private static string ReleasePayload(string tag) => JsonSerializer.Serialize(new {
-        tag_name = tag, draft = false, prerelease = false, html_url = "https://example.com/untrusted" });
+    private static string ReleasePayload(string tag, string variant = "self-contained", string? archiveUrl = null)
+    {
+        var number = tag.TrimStart('v', 'V');
+        var name = $"CodexQuotaTray-{number}-win-x64-{variant}.zip";
+        var prefix = "https://github.com/chocoQAQ/CodexQuotaTray/releases/download/" + tag + "/";
+        return JsonSerializer.Serialize(new { tag_name = tag, draft = false, prerelease = false,
+            html_url = "https://example.com/untrusted",
+            assets = new[] {
+                new { name, browser_download_url = archiveUrl ?? prefix + name, size = 500 },
+                new { name = "SHA256SUMS.txt", browser_download_url = prefix + "SHA256SUMS.txt", size = 200 }
+            } });
+    }
+    private static string TemporaryDirectory()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "CodexQuotaTray-update-test-" + Guid.NewGuid());
+        Directory.CreateDirectory(path);
+        return path;
+    }
+    private static AvailableUpdate FixtureUpdate(long size) => new(new Version(9, 0, 0, 1),
+        new Uri("https://github.com/chocoQAQ/CodexQuotaTray/releases/tag/v9.0.0.1"),
+        "CodexQuotaTray-9.0.0.1-win-x64-no-runtime.zip",
+        new Uri("https://github.com/chocoQAQ/CodexQuotaTray/releases/download/v9.0.0.1/CodexQuotaTray-9.0.0.1-win-x64-no-runtime.zip"),
+        new Uri("https://github.com/chocoQAQ/CodexQuotaTray/releases/download/v9.0.0.1/SHA256SUMS.txt"), size);
+    private static HttpResponseMessage BytesResponse(byte[] bytes) => new(HttpStatusCode.OK) { Content = new ByteArrayContent(bytes) };
+    private static byte[] TestArchive(string? extra = null)
+    {
+        using var memory = new MemoryStream();
+        using (var zip = new ZipArchive(memory, ZipArchiveMode.Create, true))
+        {
+            foreach (var name in new[] { "CodexQuotaTray.exe", "README.md" }.Concat(extra is null ? [] : new[] { extra }))
+            {
+                using var writer = new StreamWriter(zip.CreateEntry(name).Open());
+                writer.Write(name == "CodexQuotaTray.exe" ? "test-executable" : "test-readme");
+            }
+        }
+        return memory.ToArray();
+    }
     private sealed class Handler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> send) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => send(request, cancellationToken);

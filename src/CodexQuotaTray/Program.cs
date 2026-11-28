@@ -13,11 +13,14 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         try
         {
+            // 临时更新器不创建托盘、不读取账号，也不参与普通实例互斥锁。
+            if (args.Length == 2 && args[0] == "--apply-update") return UpdateInstaller.Apply(args[1]);
             string? home = null;
             string? diagnosis = null;
             string? readyEvent = null;
             var skipUpdateCheck = false;
             int? codexStarted = null;
+            var followSession = false;
             for (var i = 0; i < args.Length; i++)
             {
                 switch (args[i])
@@ -26,6 +29,7 @@ internal static class Program
                     case "--diagnose" when i + 1 < args.Length: diagnosis = args[++i]; break;
                     case "--update-ready" when i + 1 < args.Length: readyEvent = args[++i]; break;
                     case "--skip-update-check": skipUpdateCheck = true; break;
+                    case "--follow-session": followSession = true; break;
                     case "--codex-started" when i + 1 < args.Length:
                         if (!int.TryParse(args[++i], out var processId)) return 0;
                         codexStarted = processId;
@@ -34,11 +38,12 @@ internal static class Program
                 }
             }
             if (home is not null) home = Path.GetFullPath(home);
+            if (readyEvent is null && UpdateInstaller.IsApplying()) return 0;
             if (codexStarted is { } pid && !CodexStartupProcess.IsCurrentUserDesktop(pid)) return 0;
             using var singleInstance = new SingleInstance();
             if (!singleInstance.IsFirst)
             {
-                if (codexStarted is null) SingleInstance.ShowExisting();
+                if (codexStarted is null && readyEvent is null) SingleInstance.ShowExisting();
                 return 0;
             }
             using var http = UsageClient.CreateHttpClient();
@@ -72,8 +77,15 @@ internal static class Program
             using var updateHttp = UpdateClient.CreateHttpClient();
             var installedVersion = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0, 0, 0);
             using var context = new TrayApplication(monitor, CreateMonitor, settings, preferences, startup, codexStartup,
-                new UpdateClient(updateHttp), installedVersion, !skipUpdateCheck, codexStarted is not null);
-            if (readyEvent is not null) SignalLegacyUpdateReady(readyEvent);
+                new UpdateInstaller(Environment.ProcessPath ?? Application.ExecutablePath, home is null ? [] : ["--codex-home", home]),
+                new UpdateClient(updateHttp, UpdateInstaller.BuildVariant), installedVersion, !skipUpdateCheck, codexStarted is not null || followSession);
+            if (readyEvent is not null)
+            {
+                EventHandler? ready = null;
+                ready = (_, _) => { Application.Idle -= ready; SignalUpdateReady(readyEvent); };
+                Application.Idle += ready; // UI 消息循环已开始，才确认启动成功。
+            }
+            _ = Task.Run(UpdateInstaller.CleanupOldWorkDirectories);
             Application.Run(context);
             return 0;
         }
@@ -88,8 +100,8 @@ internal static class Program
             return 1;
         }
     }
-    // 兼容已发布的 v1.3.0.2 更新器的启动握手；此版本本身不下载或替换文件。
-    private static void SignalLegacyUpdateReady(string name)
+    // 同时兼容已发布的 v1.3.0.2 更新器的启动握手。
+    private static void SignalUpdateReady(string name)
     {
         const string prefix = @"Local\CodexQuotaTray.UpdateReady.";
         if (!name.StartsWith(prefix, StringComparison.Ordinal) || !Guid.TryParseExact(name[prefix.Length..], "N", out _)) return;

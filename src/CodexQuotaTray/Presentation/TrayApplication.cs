@@ -20,6 +20,9 @@ internal sealed class TrayApplication : ApplicationContext
     private Task? codexExitTask;
     private CancellationTokenSource? codexExitCancellation;
     private readonly IUpdateClient updates;
+    private readonly UpdateInstaller installer;
+    private bool installing;
+    private UpdateProgressForm? updateProgress;
     private readonly Version installedVersion;
     private readonly TrayIcon tray = new();
     private readonly DetailsForm details = new();
@@ -40,7 +43,7 @@ internal sealed class TrayApplication : ApplicationContext
 
     public TrayApplication(QuotaMonitor monitor, Func<QuotaSourceKind, QuotaMonitor> createMonitor,
         SettingsStore settings, AppSettings preferences, StartupRegistration startup,
-        CodexStartupRegistration codexStartup, IUpdateClient updates,
+        CodexStartupRegistration codexStartup, UpdateInstaller installer, IUpdateClient updates,
         Version installedVersion, bool checkOnStartup, bool startedByCodex = false)
     {
         this.monitor = monitor;
@@ -51,6 +54,7 @@ internal sealed class TrayApplication : ApplicationContext
         this.codexStartup = codexStartup;
         codexExit = new CodexExitMonitor(startedByCodex);
         this.updates = updates;
+        this.installer = installer;
         this.installedVersion = installedVersion;
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
         menu.Items.Add("打开", null, (_, _) => ShowDetails());
@@ -66,9 +70,9 @@ internal sealed class TrayApplication : ApplicationContext
         details.UpdateCheckRequested += ToggleUpdateCheck;
         details.CodexStartupRequested += () =>
         {
-            if (!closing && !codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(!codexStartupEnabled);
+            if (!closing && !installing && !codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(!codexStartupEnabled);
         };
-        details.SourceRequested += kind => { if (!closing && !changingSource) settingsTask = ChangeSourceAsync(kind); };
+        details.SourceRequested += kind => { if (!closing && !installing && !changingSource) settingsTask = ChangeSourceAsync(kind); };
         details.RepositoryRequested += () => OpenLink("https://github.com/chocoQAQ/CodexQuotaTray");
         details.TaskbarSettingsRequested += () => OpenLink("ms-settings:taskbar");
         refreshTimer.Tick += (_, _) => StartRefresh();
@@ -105,13 +109,66 @@ internal sealed class TrayApplication : ApplicationContext
             if (closing || updateCancellation.IsCancellationRequested || !preferences.CheckForUpdatesOnStartup ||
                 result.Status != UpdateCheckStatus.Available || result.Update is not { } update) return;
             var answer = MessageBox.Show(
-                $"发现新版本 v{update.Version}\n当前版本 v{installedVersion}\n\n是否打开 GitHub 发行页面？",
+                $"发现新版本 v{update.Version}\n当前版本 v{installedVersion}\n\n是否下载并自动安装？\n安装完成后圆环将重新启动。",
                 "CodexQuotaTray · 发现更新", MessageBoxButtons.YesNo,
                 MessageBoxIcon.Information, MessageBoxDefaultButton.Button2);
-            if (answer == DialogResult.Yes && !closing) OpenLink(update.ReleasePage.AbsoluteUri);
+            if (answer == DialogResult.Yes && !closing && preferences.CheckForUpdatesOnStartup)
+                await InstallUpdateAsync(update);
         }
         catch (OperationCanceledException) when (updateCancellation.IsCancellationRequested) { }
         catch (Exception) { /* 网络失败不打扰用户，下次启动再检查。 */ }
+    }
+
+    private async Task InstallUpdateAsync(AvailableUpdate update)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, updateCancellation.Token);
+        using var window = new UpdateProgressForm();
+        installing = true;
+        updateProgress = window;
+        codexExitCancellation?.Cancel();
+        refreshCancellation?.Cancel();
+        window.CancelRequested += () => cancellation.Cancel();
+        string? directory = null;
+        var launched = false;
+        UpdateSettings();
+        Render();
+        try
+        {
+            if (codexExitTask is not null) await codexExitTask;
+            if (codexStartupTask is not null) await codexStartupTask;
+            if (settingsTask is not null) await settingsTask;
+            cancellation.Token.ThrowIfCancellationRequested();
+            directory = await Task.Run(installer.CreateWorkDirectory, cancellation.Token);
+            window.Show();
+            using var http = UpdateDownloader.CreateHttpClient();
+            var progress = new Progress<UpdateProgress>(window.Report);
+            var prepared = await Task.Run(() => new UpdateDownloader(http).PrepareAsync(update, directory, progress, cancellation.Token));
+            cancellation.Token.ThrowIfCancellationRequested();
+            window.BeginInstall();
+            await installer.LaunchAsync(prepared, update, codexStartupEnabled && codexExit.HasObservedDesktop, cancellation.Token);
+            launched = true;
+            ExitThread();
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (Exception)
+        {
+            if (!closing) MessageBox.Show("自动更新未完成，当前版本仍可继续使用。请检查网络、磁盘空间及程序目录的写入权限。\n" +
+                "稍后重新启动圆环可再次检查，或通过界面的 GitHub 链接手动下载。",
+                "CodexQuotaTray · 更新失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            updateProgress = null;
+            window.AllowClose = true;
+            if (!window.IsDisposed) window.Close();
+            if (!launched && directory is not null) UpdateInstaller.DeleteWorkDirectory(directory);
+            installing = false;
+            if (!closing)
+            {
+                UpdateSettings(); Render(); StartRefresh();
+                if (!codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(null);
+            }
+        }
     }
 
     private async Task ChangeSourceAsync(QuotaSourceKind kind)
@@ -146,7 +203,7 @@ internal sealed class TrayApplication : ApplicationContext
     private void StartRefresh()
     {
         StartFollowingCodex();
-        if (closing || refreshing || changingSource) return;
+        if (closing || installing || refreshing || changingSource) return;
         refreshTask = RefreshAsync();
     }
 
@@ -177,7 +234,7 @@ internal sealed class TrayApplication : ApplicationContext
         var tooltip = main is null ? state.Message :
             $"Codex 剩余 {QuotaText.Percent(main)}{suffix}\n重置 {QuotaText.Reset(main)}\n{QuotaText.Countdown(main, now)}";
         tray.Update(RingRenderer.CreateIcon(main?.RemainingPercent, main?.TimeRemainingPercent(now), stale), tooltip);
-        refreshItem.Enabled = !refreshing && !changingSource;
+        refreshItem.Enabled = !installing && !refreshing && !changingSource;
         if (details.Visible) details.Render(state, refreshing);
     }
 
@@ -190,7 +247,7 @@ internal sealed class TrayApplication : ApplicationContext
         details.WindowState = FormWindowState.Normal;
         details.Activate();
         // 启动和打开设置时读取任务状态，正常额度轮询不连接任务计划服务。
-        if (!codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(null);
+        if (!installing && !codexStartupBusy) codexStartupTask = UpdateCodexStartupAsync(null);
     }
 
     private async Task UpdateCodexStartupAsync(bool? enabled)
@@ -222,14 +279,14 @@ internal sealed class TrayApplication : ApplicationContext
         finally
         {
             codexStartupBusy = false;
-            if (!closing) details.SetCodexStartup(codexStartupEnabled, false, available);
+            if (!closing) details.SetCodexStartup(codexStartupEnabled, installing, available);
             if (available) StartFollowingCodex();
         }
     }
 
     private void StartFollowingCodex()
     {
-        if (closing || codexStartupBusy || !codexStartupEnabled || codexExitTask is { IsCompleted: false }) return;
+        if (closing || installing || codexStartupBusy || !codexStartupEnabled || codexExitTask is { IsCompleted: false }) return;
         codexExitTask = FollowCodexAsync();
     }
 
@@ -242,7 +299,7 @@ internal sealed class TrayApplication : ApplicationContext
             if (!await codexExit.WaitForExitAsync(cancellation.Token)) return;
             // 退出前再确认任务未在程序外被关闭/删除；失败时保留圆环。
             var enabled = await Task.Run(codexStartup.IsEnabled, cancellation.Token);
-            if (!closing && !codexStartupBusy && codexStartupEnabled && enabled && !cancellation.IsCancellationRequested)
+            if (!closing && !installing && !codexStartupBusy && codexStartupEnabled && enabled && !cancellation.IsCancellationRequested)
                 ExitThread();
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
@@ -262,14 +319,15 @@ internal sealed class TrayApplication : ApplicationContext
 
     private void UpdateSettings()
     {
-        try { details.SetSettings(preferences.Source, startup.IsEnabled(), preferences.CheckForUpdatesOnStartup, changingSource); }
+        if (installing) details.SetCodexStartup(codexStartupEnabled, true, true);
+        try { details.SetSettings(preferences.Source, startup.IsEnabled(), preferences.CheckForUpdatesOnStartup, changingSource || installing); }
         catch (Exception error) when (error is UnauthorizedAccessException or SecurityException or IOException)
-        { details.SetSettings(preferences.Source, false, preferences.CheckForUpdatesOnStartup, changingSource, false); }
+        { details.SetSettings(preferences.Source, false, preferences.CheckForUpdatesOnStartup, changingSource || installing, false); }
     }
 
     private void ToggleUpdateCheck()
     {
-        if (closing || changingSource) return;
+        if (closing || installing || changingSource) return;
         try
         {
             var next = preferences with { CheckForUpdatesOnStartup = !preferences.CheckForUpdatesOnStartup };
@@ -293,6 +351,7 @@ internal sealed class TrayApplication : ApplicationContext
 
     private void ToggleStartup()
     {
+        if (closing || installing) return;
         try { startup.SetEnabled(!startup.IsEnabled()); }
         catch (Exception error) when (error is UnauthorizedAccessException or SecurityException or IOException or ArgumentException)
         {
@@ -312,6 +371,7 @@ internal sealed class TrayApplication : ApplicationContext
         visibilityTimer.Stop();
         lifetime.Cancel();
         updateCancellation.Cancel();
+        if (updateProgress is not null) { updateProgress.AllowClose = true; updateProgress.Close(); }
         tray.Dispose();
         details.Dispose();
         menu.Dispose();

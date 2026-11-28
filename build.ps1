@@ -35,5 +35,7 @@ try {
             Compress-Archive -LiteralPath @((Join-Path $output 'CodexQuotaTray.exe'), (Join-Path $output 'README.md')) -DestinationPath $archive -Force
             Write-Output ('已生成：' + $archive)
         }
+        # 发布前验证真实跨进程替换与失败回滚，夹具不访问用户账号或托盘。
+        & (Join-Path $PSScriptRoot 'tests/UpdateIntegration.ps1')
     }
 } finally { Pop-Location }

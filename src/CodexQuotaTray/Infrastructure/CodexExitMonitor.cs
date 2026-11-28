@@ -16,6 +16,7 @@ public sealed class CodexExitMonitor(
     Func<CancellationToken, Task>? restartGrace = null)
 {
     private bool observed = observedDesktop;
+    public bool HasObservedDesktop => observed;
     private readonly Func<CodexDesktopSnapshot> read = readDesktop ?? ReadDesktop;
     private readonly Func<CancellationToken, Task> grace = restartGrace ?? (token => Task.Delay(TimeSpan.FromSeconds(2), token));
 

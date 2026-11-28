@@ -7,7 +7,8 @@ namespace CodexQuotaTray.Core;
 
 public enum UpdateCheckStatus { Current, Available, Unavailable }
 
-public sealed record AvailableUpdate(Version Version, Uri ReleasePage);
+public sealed record AvailableUpdate(Version Version, Uri ReleasePage,
+    string ArchiveName, Uri ArchiveUrl, Uri ChecksumsUrl, long ArchiveSize);
 
 public sealed record UpdateCheckResult(UpdateCheckStatus Status, AvailableUpdate? Update = null, string? Message = null);
 
@@ -17,7 +18,7 @@ public interface IUpdateClient
 }
 
 /// <summary>匿名读取本项目最新正式 Release；与 Codex 额度请求及凭据完全分离。</summary>
-public sealed class UpdateClient(HttpClient http) : IUpdateClient
+public sealed class UpdateClient(HttpClient http, string variant = "self-contained") : IUpdateClient
 {
     public static readonly Uri Endpoint = new("https://api.github.com/repos/chocoQAQ/CodexQuotaTray/releases/latest");
     private const int MaximumResponseBytes = 256 * 1024;
@@ -76,8 +77,29 @@ public sealed class UpdateClient(HttpClient http) : IUpdateClient
 
             // 页面由固定仓库和已验证的数字版本标签构造，不打开响应中的任意 html_url。
             var page = new Uri("https://github.com/chocoQAQ/CodexQuotaTray/releases/tag/" + tag);
-            return new(UpdateCheckStatus.Available, new AvailableUpdate(latest, page));
+            if (variant is not ("self-contained" or "no-runtime"))
+                return Unavailable("此构建不支持自动更新。");
+            var number = tag.StartsWith('v') || tag.StartsWith('V') ? tag[1..] : tag;
+            var archiveName = $"CodexQuotaTray-{number}-win-x64-{variant}.zip";
+            var assets = UsageParser.Get(root, "assets");
+            if (assets.ValueKind != JsonValueKind.Array) return Unavailable("发行版尚未提供完整更新文件。");
+            var archive = FindAsset(archiveName);
+            var checksums = FindAsset("SHA256SUMS.txt");
+            if (archive is null || checksums is null || archive.Value.Size is <= 0 or > UpdateDownloader.MaximumArchiveBytes ||
+                checksums.Value.Size is <= 0 or > 16 * 1024)
+                return Unavailable("发行版尚未提供完整更新文件。");
+            return new(UpdateCheckStatus.Available, new AvailableUpdate(latest, page,
+                archiveName, archive.Value.Url, checksums.Value.Url, archive.Value.Size));
 
+            (Uri Url, long Size)? FindAsset(string name)
+            {
+                var matches = assets.EnumerateArray().Where(a => UsageParser.Text(a, "name") == name).ToArray();
+                if (matches.Length != 1) return null;
+                var expected = "https://github.com/chocoQAQ/CodexQuotaTray/releases/download/" + tag + "/" + name;
+                if (UsageParser.Text(matches[0], "browser_download_url") != expected) return null;
+                var size = UsageParser.Get(matches[0], "size");
+                return size.ValueKind == JsonValueKind.Number && size.TryGetInt64(out var bytes) ? (new Uri(expected), bytes) : null;
+            }
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
